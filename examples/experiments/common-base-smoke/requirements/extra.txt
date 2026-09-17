@@ -1,0 +1,3 @@
+# Python dependency declaration mounted read-only into the Common Base.
+# This functional smoke fixture needs no extra Python package; real experiments
+# put exact name==version entries (and optional hashes/index directives) here.

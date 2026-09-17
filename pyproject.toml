@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools==82.0.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "benchpark-container-extension"
+version = "1.0.0.dev4"
+description = "External Common Base Container execution and per-run CER for Benchpark"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+dependencies = ["PyYAML==6.0.3", "packaging==25.0"]
+
+[project.optional-dependencies]
+test = ["pytest==9.0.2", "setuptools==82.0.1"]
+
+[project.entry-points."benchpark.extensions"]
+container = "benchpark_container.plugin:describe"
+
+[project.entry-points."benchpark.preparers"]
+tune = "benchpark_tuning.plugin:describe"
+
+[project.entry-points."benchpark.commands"]
+cer = "benchpark_container.cli:command_descriptor"
+container = "benchpark_container.container_cli:command_descriptor"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+benchpark_container = ["resources/**/*", "resources/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = ["runtime: requires a real container runtime and a supplied Common Base image", "upstream: requires a local real Benchpark checkout and Ramble"]
+
+[tool.setuptools.exclude-package-data]
+"*" = ["**/__pycache__/*", "**/*.pyc", "**/*.pyo"]
+
+# The Core loader discovers the integration broker only at declared boundaries.
+[project.entry-points."benchpark.lifecycle.v1"]
+container = "benchpark_integration.hooks:provider"
+tune = "benchpark_integration.hooks:provider"
+
+[project.entry-points."benchpark.cli.v1"]
+cer = "benchpark_integration.hooks:cer_command"
+container = "benchpark_container.container_cli:cli_command"

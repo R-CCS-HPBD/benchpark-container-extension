@@ -1,0 +1,5 @@
+schema_version: 1
+# Execution-only difference; workload size/iterations/model remain unchanged.
+# This is a functional fixture, not a claim that this setting improves speed.
+overrides:
+  execution_mode: inference
