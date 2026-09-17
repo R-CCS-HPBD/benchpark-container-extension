@@ -30,14 +30,6 @@ Installing this extension does **not** make container execution the default and 
 
 This project is an extension for an existing Benchpark checkout.
 
-The current implementation has been validated against:
-
-```text
-Repository: RIKEN-RCCS/benchpark
-Branch:     FN_apps
-Commit:     817a8a9b29ce3a9c5cca39d8a53c97b6ae6ca0f7
-```
-
 The Core integration generator is intentionally conservative. For a different Benchpark revision, always generate the patch and run `git apply --check` before applying it.
 
 ### Python
@@ -90,23 +82,29 @@ Do not copy the extension source tree into the Benchpark repository.
 mkdir -p ~/src
 cd ~/src
 
-git clone https://github.com/R-CCS-HPBD/benchpark-container-extension.git
+git clone https://github.com/<ORG>/benchpark-container-extension.git
 cd benchpark-container-extension
 ```
 
-For a released version, use a fixed tag:
+Replace `<ORG>` with the GitHub organization or account that hosts this repository.
+
+Record the exact extension revision used for the installation:
 
 ```bash
-git checkout v1.0.0
+git rev-parse HEAD
 ```
 
-or:
+For reproducibility, record both the Benchpark commit and the Benchpark Container Extension commit used for a benchmark environment.
 
-```bash
-git clone https://github.com/R-CCS-HPBD/benchpark-container-extension.git
+```text
+Benchpark repository
+    commit A
+
+Benchpark Container Extension repository
+    commit B
 ```
 
-Using a fixed release tag is recommended for reproducible installations.
+The normal installation flow uses the checked-out repository state. A specific historical revision may be checked out when reproducing an older environment, but the standard installation procedure does not require a particular release tag.
 
 ## 2. Inspect the existing Benchpark checkout
 
@@ -181,7 +179,28 @@ The Core patch adds a **generic external plugin seam**. Container runtimes, Cata
 
 ## 6. Install the extension
 
-Install the extension into the same Python environment used to run Benchpark:
+**Recommended:** use the same Python virtual environment that is used to run Benchpark.
+
+The Benchpark source repository and the Benchpark Container Extension source repository remain separate, but their Python runtime environment is shared:
+
+```text
+Git repositories:
+    separate
+
+Python environment:
+    shared
+```
+
+Activate the Benchpark virtual environment before installing the extension:
+
+```bash
+source /path/to/benchpark-venv/bin/activate
+
+which python
+which benchpark
+```
+
+Then install the extension from its repository:
 
 ```bash
 cd ~/src/benchpark-container-extension
@@ -189,10 +208,18 @@ cd ~/src/benchpark-container-extension
 python -m pip install .
 ```
 
-For extension development:
+Installing into the Benchpark virtual environment is recommended because the extension is discovered through Python package entry points. Installing it into an unrelated Python environment can prevent Benchpark from discovering `+container`, `benchpark container`, and `benchpark cer`.
+
+For extension development, use the same Benchpark virtual environment and install the checkout in editable mode:
 
 ```bash
 python -m pip install -e .
+```
+
+You can confirm the installed package with:
+
+```bash
+python -m pip show benchpark-container-extension
 ```
 
 ## 7. Verify Benchpark plugin discovery
@@ -545,6 +572,50 @@ The Container Catalog owns reusable retained base environments:
 - managed SIF or OCI content
 - source provenance
 
+## How Benchpark discovers the extension
+
+The Benchpark repository and this extension repository remain physically separate.
+
+Running:
+
+```bash
+python -m pip install .
+```
+
+from the extension repository installs the extension package and its Python entry-point metadata into the Python environment used by Benchpark.
+
+The generic plugin seam added to Benchpark Core discovers those entry points at runtime.
+
+```text
+~/src/
+├── benchpark/
+│     └── Benchpark Core
+│
+└── benchpark-container-extension/
+      └── python -m pip install .
+                   |
+                   v
+          Benchpark Python venv
+                   |
+                   | Python entry points
+                   v
+          Benchpark plugin seam
+             /        |        \
+       +container  container    cer
+```
+
+This separation is intentional:
+
+```text
+Source ownership:
+    separate Git repositories
+
+Runtime integration:
+    shared Python environment
+```
+
+As a result, the container implementation does not need to be copied into the Benchpark source tree. Benchpark only contains the generic integration seam, while the extension package provides the external commands, lifecycle hooks, and `+container` feature through Python entry points.
+
 ---
 
 # Container Catalog and Managed Artifacts
@@ -861,9 +932,10 @@ Release history should be maintained through Git tags rather than by embedding p
 
 # Development
 
-Install development and test dependencies:
+For development against a Benchpark checkout, activate the same Python virtual environment used by Benchpark before installing development dependencies:
 
 ```bash
+source /path/to/benchpark-venv/bin/activate
 python -m pip install -e '.[test]'
 ```
 
