@@ -857,48 +857,6 @@ Storage capacity, backup, retention, authentication, licensing, and site securit
 
 ---
 
-# Validation Status
-
-The current implementation has been exercised end-to-end on an NVIDIA DGX Spark environment.
-
-Validation platform:
-
-```text
-Architecture: aarch64
-GPU:          NVIDIA GB10
-CUDA:         13.0
-Apptainer:    1.5.0
-Docker:       28.5.1
-Benchpark:    RIKEN-RCCS/benchpark FN_apps
-Commit:       817a8a9b29ce3a9c5cca39d8a53c97b6ae6ca0f7
-```
-
-Validated flows:
-
-| Validation item | Status |
-|---|---:|
-| Existing Benchpark plus generated Core integration patch | PASS |
-| Extension discovery through Benchpark CLI | PASS |
-| Managed SIF registration and validation | PASS |
-| Benchpark -> Ramble -> Managed SIF -> Apptainer | PASS |
-| Apptainer NVIDIA GPU execution | PASS |
-| Managed OCI registration and validation | PASS |
-| Benchpark -> Ramble -> Managed OCI -> Docker | PASS |
-| Docker NVIDIA GPU execution | PASS |
-| Per-experiment Apptainer / Docker selection on one System | PASS |
-| Run-local requirements and setup additions | PASS |
-| CER creation and structural validation | PASS |
-| Managed SIF execution after removing the registration source copy | PASS |
-| Managed OCI restoration after removing the Docker daemon image | PASS |
-| Native Benchpark / Spack non-regression | PASS |
-| BabelStream 5.0 CUDA execution on NVIDIA GB10 | PASS |
-| Apptainer masquerading as SingularityCE is rejected | PASS |
-| Genuine SingularityCE end-to-end validation | PENDING |
-
-The SingularityCE backend is implemented. Final acceptance on a genuine SingularityCE installation remains pending.
-
----
-
 # Repository Layout
 
 The public repository contains only source, packaging, examples, tests, and integration tooling:
