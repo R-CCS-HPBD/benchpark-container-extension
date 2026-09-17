@@ -82,11 +82,9 @@ Do not copy the extension source tree into the Benchpark repository.
 mkdir -p ~/src
 cd ~/src
 
-git clone https://github.com/<ORG>/benchpark-container-extension.git
+git clone https://github.com/R-CCS-HPBD/benchpark-container-extension.git
 cd benchpark-container-extension
 ```
-
-Replace `<ORG>` with the GitHub organization or account that hosts this repository.
 
 Record the exact extension revision used for the installation:
 
