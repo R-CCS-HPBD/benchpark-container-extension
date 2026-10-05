@@ -126,7 +126,26 @@ class SIFRuntimeBackend(RuntimeBackend):
             raise ValidationError("Resolve OCI to a pinned SIF before building the command")
         if any(c in str(image) for c in ':,\n\r\x00') or str(image).startswith('-'):
             raise ValidationError("Cannot encode bind/image path: " + str(image))
-        args = [self.executable, "exec", "--cleanenv", "--containall", "--no-home", "--no-eval"]
+        scratch_mount = next(
+            (m for m in request.mounts if m.target == "/bpce" and not m.readonly),
+            None,
+        )
+        if scratch_mount is None:
+            raise ValidationError(
+                "SIF contained execution requires the writable /bpce scratch mount"
+            )
+        contained_workdir = Path(scratch_mount.source) / ".contained-workdir"
+        contained_workdir.mkdir(parents=True, exist_ok=True)
+
+        args = [
+            self.executable,
+            "exec",
+            "--cleanenv",
+            "--containall",
+            "--no-eval",
+            "--workdir",
+            str(contained_workdir),
+        ]
         if request.accelerator == "nvidia":
             args.append("--nv")
         elif request.accelerator == "amd":

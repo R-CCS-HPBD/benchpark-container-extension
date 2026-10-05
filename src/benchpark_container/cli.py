@@ -2,7 +2,7 @@
 """Read/export per-attempt CER. Never guess a missing run's actual conditions."""
 import json
 from pathlib import Path
-from .util import identity, atomic_json, ValidationError
+from .util import identity, atomic_json, ValidationError, sha256
 
 
 def command_descriptor():
@@ -49,6 +49,30 @@ def load_record(path):
     return data
 
 
+def verify_recorded_files(record_path, data):
+    """Verify bytes named by files[] inside a sealed schema-v2 CER attempt."""
+    path=Path(record_path)
+    if path.is_dir():
+        path=path / ("cer.json" if (path / "cer.json").is_file() else "started.json")
+    root=path.parent.resolve()
+    checked=0
+    for rel, meta in (data.get("files") or {}).items():
+        rel_path=Path(rel)
+        if rel_path.is_absolute() or ".." in rel_path.parts:
+            raise ValidationError("Unsafe CER file path: " + str(rel))
+        target=(root / rel_path).resolve()
+        if root not in target.parents and target != root:
+            raise ValidationError("CER file escapes attempt directory: " + str(rel))
+        if not target.is_file() or target.is_symlink():
+            raise ValidationError("CER recorded file missing/not regular: " + str(rel))
+        if target.stat().st_size != int(meta.get("bytes", -1)):
+            raise ValidationError("CER recorded file size mismatch: " + str(rel))
+        if sha256(target) != meta.get("sha256"):
+            raise ValidationError("CER recorded file checksum mismatch: " + str(rel))
+        checked += 1
+    return checked
+
+
 def differences(left, right, path=""):
     if isinstance(left, dict) and isinstance(right, dict):
         result = []
@@ -82,8 +106,10 @@ def command(args):
                 atomic_json(args.output, result)
                 result = {"exported": str(args.output), "source_unchanged": True}
             elif action == "validate":
+                legacy = result.get("schema") == "legacy"
+                checked = None if legacy else verify_recorded_files(args.record, result)
                 result = {"valid_record_structure": True, "scientific_equivalence": "not-assessed",
-                          "legacy": result.get("schema") == "legacy"}
+                          "legacy": legacy, "recorded_files_verified": checked}
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0
     except (ValueError, OSError, KeyError) as e:

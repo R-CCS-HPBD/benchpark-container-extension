@@ -18,6 +18,7 @@ def build():
     source = ROOT / "src/benchpark_container"
     data = {"__main__.py": b"from bpce_node.runtime import main\nraise SystemExit(main())\n"}
     modules = MODULES + [str(p.relative_to(source)) for p in sorted((source / "backends").rglob("*.py"))]
+    modules += [str(p.relative_to(source)) for p in sorted((source / "cer" / "collectors").rglob("*.py"))]
     data.update({"bpce_node/" + n: (source / n).read_bytes() for n in modules})
     out = io.BytesIO()
     with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as z:

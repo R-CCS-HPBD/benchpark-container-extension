@@ -6,6 +6,8 @@ import platform
 import socket
 import uuid
 from ..util import atomic_json, identity, sha256
+from .collectors import collect_v1
+from .collectors.base import merge_additive, merge_file_metadata
 
 
 def now():
@@ -36,17 +38,39 @@ def start_run(root, spec):
 
 
 def finish_run(directory, record):
+    directory = Path(directory)
+    if (directory / "cer.json").exists():
+        raise FileExistsError(str(directory / "cer.json"))
     record["finished_at"] = now()
+
+    # Additive post-run reproducibility evidence. Collection is intentionally
+    # outside condition/plan identity and is non-fatal to benchmark status.
+    collected = collect_v1(directory, record)
+    try:
+        merge_additive(record.setdefault("observed", {}), collected["observed"])
+    except ValueError as exc:
+        collected["collection"]["status"] = "partial"
+        collected["collection"].setdefault("finalization_errors", []).append(str(exc))
+    record["collection"] = collected["collection"]
+
     files = {}
-    for p in sorted(Path(directory).iterdir()):
+    try:
+        merge_file_metadata(files, collected["files"])
+    except ValueError as exc:
+        record["collection"]["status"] = "partial"
+        record["collection"].setdefault("finalization_errors", []).append(str(exc))
+    for p in sorted(directory.iterdir()):
         if p.is_file() and p.name not in ("cer.json", "started.json"):
-            files[p.name] = {"sha256": sha256(p), "bytes": p.stat().st_size}
+            meta = {"sha256": sha256(p), "bytes": p.stat().st_size}
+            merge_file_metadata(files, {p.name: meta})
     # Result artifacts live on private mounts outside the mutable Python env.
     # Do not hash the whole venv, model cache, or unbounded external trees.
-    for p in sorted((Path(directory) / "outputs").rglob("*")):
+    for p in sorted((directory / "outputs").rglob("*")):
         if p.is_file() and not p.is_symlink():
-            files[str(p.relative_to(directory))] = {"sha256": sha256(p), "bytes": p.stat().st_size}
+            key = str(p.relative_to(directory))
+            meta = {"sha256": sha256(p), "bytes": p.stat().st_size}
+            merge_file_metadata(files, {key: meta})
     record["files"] = files
     record["record_sha256"] = identity(record)
-    atomic_json(Path(directory) / "cer.json", record)
+    atomic_json(directory / "cer.json", record)
     # started.json is intentionally retained. No final record is ever overwritten.

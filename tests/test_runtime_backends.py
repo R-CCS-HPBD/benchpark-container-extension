@@ -199,9 +199,19 @@ def test_sif_cli_identity_environment_and_devices(tmp_path, monkeypatch, name, p
     assert ('--nv' in command) is (gpu == 'nvidia')
     assert ('--rocm' in command) is (gpu == 'amd')
     assert '--cleanenv' in command and '--containall' in command and '--no-eval' in command
+    assert '--workdir' in command
+    workdir = Path(command[command.index('--workdir') + 1])
+    assert workdir == scratch/'.contained-workdir'
+    assert workdir.is_dir()
+    assert '--no-home' not in command
     assert str(inputs)+':/bpce/inputs:ro' in command
     values = [next(csv.reader([command[i+1]]))[0] for i,arg in enumerate(command) if arg=='--env']
     assert 'CUDA_VISIBLE_DEVICES=0,2' in values and 'X=$(literal),two' in values
+    assert not any(v.startswith('HOME=') for v in values)
+    assert 'XDG_CACHE_HOME=/bpce/cache' in values
+    assert 'TMPDIR=/bpce/tmp' in values
+    assert (scratch/'cache').is_dir()
+    assert (scratch/'tmp').is_dir()
     env = rt.host_env()
     assert prefix+'CACHEDIR' in env
     assert 'APPTAINER_BIND' not in env and 'SINGULARITYENV_X' not in env

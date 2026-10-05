@@ -1,0 +1,14 @@
+Benchpark Common Base Container / CER Extension
+License: Apache-2.0
+
+The legacy CER data model and legacy tests retained under historical paths are
+kept only for backward-compatibility/history and retain their original notices.
+
+All current extension/Core hook/runtime/patch/test/example files in this
+repository are provided under Apache-2.0. No PyTorch, CUDA, ROCm, model weights,
+container images, credentials, host site-packages, Python interpreter, pip
+implementation, installer bundle, or Python package payload is distributed as
+part of the current container execution path.
+
+This is not an official LLNL, RIKEN, NVIDIA, AMD or Ramble release, nor an
+indication of upstream acceptance of the proposed APIs.

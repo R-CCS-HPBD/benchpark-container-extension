@@ -69,19 +69,23 @@ def audit(root):
                 backend_module = (name.startswith('bpce_node/backends/') and name.endswith('.py')
                     and '..' not in Path(name).parts
                     and (root / 'src/benchpark_container' / name.removeprefix('bpce_node/')).is_file())
-                if backend_module:
+                collector_module = (name.startswith('bpce_node/cer/collectors/') and name.endswith('.py')
+                    and '..' not in Path(name).parts
+                    and (root / 'src/benchpark_container' / name.removeprefix('bpce_node/')).is_file())
+                worker_module = backend_module or collector_module
+                if worker_module:
                     source = root / 'src/benchpark_container' / name.removeprefix('bpce_node/')
                     if z.read(name) != source.read_bytes():
-                        issue(runtime_zip, 0, 'INV-BUNDLE: backend source/bundle mismatch ' + name)
+                        issue(runtime_zip, 0, 'INV-BUNDLE: worker source/bundle mismatch ' + name)
                     for node in ast.walk(ast.parse(z.read(name).decode('utf-8'))):
                         if isinstance(node, ast.Import):
                             for alias in node.names:
                                 if alias.name.split('.')[0] not in __import__('sys').stdlib_module_names:
-                                    issue(runtime_zip, 0, 'INV-BUNDLE: non-stdlib backend dependency ' + alias.name)
+                                    issue(runtime_zip, 0, 'INV-BUNDLE: non-stdlib worker dependency ' + alias.name)
                         elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
                             if node.module.split('.')[0] not in __import__('sys').stdlib_module_names:
-                                issue(runtime_zip, 0, 'INV-BUNDLE: non-stdlib backend dependency ' + node.module)
-                if name not in allowed and not backend_module:
+                                issue(runtime_zip, 0, 'INV-BUNDLE: non-stdlib worker dependency ' + node.module)
+                if name not in allowed and not worker_module:
                     issue(runtime_zip, 0, 'INV-INJECT: unexpected host worker bundle member ' + name)
 
     prep_path = root / 'src/benchpark_container/preparation.py'

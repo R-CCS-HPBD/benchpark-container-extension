@@ -169,12 +169,26 @@ class RuntimeBackend:
         raise NotImplementedError
 
     def argv(self, image, scratch, inputs, mounts, command, environment=None, pwd="/bpce/work"):
-        """Compatibility adapter used by the unchanged preparation algorithm."""
-        all_mounts = [Mount(str(Path(scratch).resolve()), "/bpce", False)]
+        """Compatibility adapter used by the unchanged preparation algorithm.
+
+        The host HOME is intentionally not exposed to contained runtimes.
+        Give the workload a private writable home/cache/tmp under the
+        per-attempt scratch bind instead. Explicit experiment environment
+        values still win.
+        """
+        scratch = Path(scratch).resolve()
+        private_cache = scratch / "cache"
+        private_tmp = scratch / "tmp"
+        for path in (private_cache, private_tmp):
+            path.mkdir(parents=True, exist_ok=True)
+
+        all_mounts = [Mount(str(scratch), "/bpce", False)]
         if Path(inputs).is_dir():
             all_mounts.append(Mount(str(Path(inputs).resolve()), "/bpce/inputs", True))
         all_mounts.extend(Mount(m["resolved_source"], m["target"], m["readonly"]) for m in mounts)
         env = {k: str(v) for k, v in (environment or {}).items()}
+        env.setdefault("XDG_CACHE_HOME", "/bpce/cache")
+        env.setdefault("TMPDIR", "/bpce/tmp")
         env.update({k: os.environ[k] for k in GPU_ENV if k in os.environ})
         return self.build_command(ExecutionRequest(image, tuple(all_mounts), env, pwd,
                     tuple(command), self.settings.get("gpu", "none")))
