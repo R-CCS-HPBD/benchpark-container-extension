@@ -1,112 +1,177 @@
 # Benchpark Container Extension
 
-Benchpark Container Extension adds **explicit, reproducible container execution** to an existing Benchpark installation while preserving Benchpark's native Spack workflow.
-
-Container execution is opt-in:
+Benchpark Container Extension adds **opt-in container execution** to Benchpark while preserving the existing native Spack workflow.
 
 ```text
-Benchpark
-├── experiment without +container  -> existing Benchpark / Spack workflow
-└── experiment with    +container  -> Benchpark Container Extension
+Benchpark experiment
+├── without +container  -> native Benchpark / Spack
+└── with    +container  -> Benchpark Container Extension
 ```
 
-Installing this package does **not** make containers the default and does not redirect existing non-container experiments.
+The extension is intentionally external to Benchpark Core. It provides container runtime selection, immutable container artifact management, run-local software additions, and Container Execution Records (CERs) without turning container execution into the default path.
 
-The public repository contains the generic container-execution extension only. AI benchmark/model resources such as ResNet, vLLM, datasets, model weights, and model-specific overlays are intentionally maintained separately.
+> This repository contains the **generic container execution infrastructure only**.  
+> Benchmark/model-specific resources such as ResNet, vLLM, datasets, model weights, and model-specific overlays are maintained separately.
 
-## Current scope
+## Features
 
-The extension currently provides:
-
-- Apptainer, SingularityCE, and Docker runtime backends
-- per-System runtime capability declaration and default runtime selection
+- Apptainer, SingularityCE, and Docker backends
+- explicit `+container` opt-in
+- per-System runtime capability and default-runtime declaration
 - per-Experiment runtime override
-- reusable immutable container releases through a Container Catalog
+- immutable container releases through a Container Catalog
 - retained SIF and OCI content through a Managed Artifact Store
-- run-local pinned Python requirements and setup scripts without modifying the managed base image
-- normal Benchpark/Ramble execution through `experiment init -> setup -> ramble`
-- Container Execution Records (CERs)
-- CER v1 hardware and container provenance collection
-- NVIDIA GPU discovery through `nvidia-smi`
-- AMD GPU discovery through `amd-smi`, with `rocminfo` fallback
-- hashed CER evidence files and recorded-file integrity validation
-- explicit runtime/image identity checks with no silent runtime fallback
-- coexistence with the existing Benchpark / Spack execution path
+- pinned run-local Python requirements and setup scripts
+- normal Benchpark/Ramble execution flow
+- CER generation for every container execution attempt
+- NVIDIA hardware provenance through `nvidia-smi`
+- AMD hardware provenance through `amd-smi`, with `rocminfo` fallback
+- container/runtime/image provenance collection
+- hashed CER evidence and integrity validation
+- no silent runtime fallback
+- no change to native Benchpark execution when `+container` is absent
 
-This repository does **not** provide:
-
-- AI benchmark/model implementations
-- model weights or datasets
-- container images
-- GPU drivers
-- time-series GPU/CPU/resource profiling
-- automatic tuning
-- automatic Managed Artifact garbage collection
-- container signature verification
-- site scheduler configuration
-
-CER provenance collection and performance profiling are intentionally separate concerns. CER records identity, configuration, selected observations, and evidence for an execution attempt; it is not a time-series profiler.
-
----
-
-# Requirements
-
-## Benchpark
-
-This project extends an existing Benchpark checkout through a small generic external-plugin seam.
-
-A Benchpark checkout that already contains a compatible generic plugin seam does not need to be patched again. For a checkout without the seam, generate and review the integration patch with `tools/patch_core.py` before applying it.
-
-## Python
+## Repository layout
 
 ```text
-Python >= 3.10
+benchpark-container-extension/
+├── core/
+│   └── files/                     # generic Benchpark plugin-seam payload
+│
+├── examples/
+│   ├── applications/              # generic Ramble application examples
+│   ├── experiments/               # generic Benchpark experiment examples
+│   ├── systems/                   # generic container-capable System examples
+│   ├── images/                    # example image/catalog metadata
+│   └── validation/                # generic validation inputs
+│
+├── src/
+│   ├── benchpark_container/
+│   │   ├── backends/              # Apptainer/Singularity/Docker backends
+│   │   ├── cer/
+│   │   │   └── collectors/        # hardware/container CER collectors
+│   │   └── resources/
+│   │       └── runtime.pyz         # packaged node-side runtime worker
+│   ├── benchpark_integration/      # generic Benchpark integration API
+│   └── benchpark_tuning/           # generic tuning/integration support
+│
+├── tests/
+│   ├── legacy/                    # retained compatibility tests
+│   └── test_*.py                  # current public regression tests
+│
+├── tools/
+│   ├── patch_core.py              # generate Benchpark integration patch
+│   ├── configure_examples.py      # configure generic examples
+│   ├── verify_runtime.py          # Linux runtime acceptance helper
+│   ├── validate_reproducibility.py
+│   ├── verify_package.py
+│   ├── verify_upstream.py
+│   ├── build_runtime.py           # build/check runtime.pyz
+│   └── audit_architecture.py      # architecture-boundary checks
+│
+├── LICENSE
+├── MANIFEST.in
+├── NOTICE
+├── pyproject.toml
+└── README.md
 ```
 
-Use the same Python environment that runs Benchpark.
+`core/` is **not** a copy of Benchpark. It contains the small generic integration seam consumed by `tools/patch_core.py`.
 
-## Supported execution hosts
+`src/benchpark_container/resources/runtime.pyz` is the portable node-side worker shipped with the extension. `tools/build_runtime.py --check` verifies that the packaged bundle matches its source.
 
-Container execution and runtime acceptance are intended for Linux systems.
+`tools/` contains support and validation utilities. The normal user-facing interface remains the `benchpark` CLI.
 
-The current runtime/platform model uses Linux container platforms such as:
+## Architecture
 
 ```text
-linux/amd64
-linux/arm64
+                    Benchpark Core
+                         |
+               generic plugin seam
+                         |
+                         v
+            Benchpark Container Extension
+                         |
+        +----------------+----------------+
+        |                |                |
+      System         Experiment     Container Catalog
+ runtime capability  workload       immutable releases
+ default runtime     image/release  retained SIF/OCI
+ platform/GPU        run-local env  artifact identity
+        |                |                |
+        +----------------+----------------+
+                         |
+                         v
+                   Runtime backend
+          Apptainer / Singularity / Docker
+                         |
+                         v
+                      benchmark
+                         |
+                         v
+                         CER
+          resolved + observed + evidence
 ```
 
-Host-only source inspection, packaging, or some unit tests may be possible elsewhere, but that is not equivalent to Linux runtime acceptance.
+### System
 
-## Container runtime
+A System describes what the machine can execute:
 
-Install at least one runtime that the target System will use:
+- available runtimes
+- runtime executables
+- default runtime
+- Linux container platform
+- GPU passthrough mode
+- runtime cache/execution settings
+- artifact roots required by experiments
 
-- Apptainer
-- SingularityCE
-- Docker
+A System does not own the reusable image inventory.
 
-## OCI import
+### Experiment
 
-Managed OCI registration uses the host `skopeo` executable:
+An Experiment describes what should be executed:
 
-```bash
-skopeo --version
-```
+- workload and parameters
+- logical image and immutable release
+- pinned requirements
+- setup scripts
+- mounts and environment
+- benchmark input/output artifacts
 
-`skopeo` is not required when only local SIF artifacts are registered.
+Container use is selected by adding `+container` to the normal Experiment specification.
 
-## GPU execution
+### Container Catalog
 
-GPU drivers and runtime-specific GPU passthrough must already work on the host.
+The Catalog owns reusable immutable base environments:
 
-The extension does not install or configure NVIDIA/AMD drivers, Docker GPU support, ROCm, or site-specific device permissions.
+- logical image name
+- release
+- platform
+- accelerator family
+- runtime bindings
+- retained SIF or OCI content
+- source provenance
+- managed artifact identity
 
----
+## Requirements
 
-# Repository layout
+- Python 3.10 or newer
+- an existing Benchpark checkout
+- Linux for actual container execution
+- at least one supported runtime:
+  - Apptainer
+  - SingularityCE
+  - Docker
+- `skopeo` when importing OCI images into managed storage
+- working host GPU drivers/device access when GPU execution is required
 
-A typical source layout keeps Benchpark and its extensions separate:
+The extension does not install GPU drivers, ROCm/CUDA, Docker GPU support, or site scheduler configuration.
+
+## Installation
+
+Benchpark and the extension should remain separate repositories.
+
+A typical development layout is:
 
 ```text
 benchpark-workspace/
@@ -116,96 +181,60 @@ benchpark-workspace/
 └── .venv/
 ```
 
-The exact parent directories are not significant. What matters is that the Benchpark source tree and Container Extension source tree remain separate.
-
-The public Container Extension repository contains the generic extension implementation:
-
-```text
-benchpark-container-extension/
-├── core/       # generic Benchpark integration seam used by the patch generator
-├── examples/   # generic container examples
-├── src/        # installable extension packages and runtime resources
-├── tests/      # current public functional/regression tests
-├── tools/      # patch, package, runtime, audit, and validation tools
-├── LICENSE
-├── NOTICE
-├── MANIFEST.in
-├── pyproject.toml
-└── README.md
-```
-
-Historical source snapshots, internal review records, authorization files, generated acceptance reports, and AI-specific resources are not part of the public repository.
-
----
-
-# Install the extension
-
-## 1. Clone Benchpark and the extension separately
-
-For example:
+### 1. Clone
 
 ```bash
-mkdir -p ~/src
-cd ~/src
-
-git clone <BENCHPARK_REPOSITORY>
 git clone https://github.com/R-CCS-HPBD/benchpark-container-extension.git
+cd benchpark-container-extension
 ```
 
-Record the exact revisions used for reproducibility:
+Record the revision used:
 
 ```bash
-git -C ~/src/benchpark rev-parse HEAD
-git -C ~/src/benchpark-container-extension rev-parse HEAD
+git rev-parse HEAD
 ```
 
-## 2. Apply the generic Core seam only when required
+For reproducibility, record the Benchpark revision as well.
+
+### 2. Ensure the Benchpark plugin seam exists
 
 If the target Benchpark checkout does not already contain the compatible generic external-plugin seam:
 
 ```bash
-cd ~/src/benchpark-container-extension
-
-python tools/patch_core.py   ~/src/benchpark   --output /tmp/benchpark-container-extension.patch
+python tools/patch_core.py \
+  /path/to/benchpark \
+  --output /tmp/benchpark-container-extension.patch
 ```
 
-Review it:
+Review and verify it before applying:
 
 ```bash
-git -C ~/src/benchpark apply   --stat   /tmp/benchpark-container-extension.patch
+git -C /path/to/benchpark apply \
+  --stat \
+  /tmp/benchpark-container-extension.patch
 
-git -C ~/src/benchpark apply   --check   /tmp/benchpark-container-extension.patch
+git -C /path/to/benchpark apply \
+  --check \
+  /tmp/benchpark-container-extension.patch
 ```
 
-Apply it only after review:
+Apply only after review:
 
 ```bash
-git -C ~/src/benchpark apply   /tmp/benchpark-container-extension.patch
+git -C /path/to/benchpark apply \
+  /tmp/benchpark-container-extension.patch
 ```
 
-`pip install` does **not** modify the Benchpark source tree.
+Installing the Python package does **not** modify Benchpark automatically.
 
-The Core patch is intentionally generic. Container runtimes, Catalog logic, CER implementation, and collectors remain in this external repository.
-
-## 3. Install into the Benchpark Python environment
-
-Activate the same virtual environment used to run Benchpark:
+### 3. Install into the Benchpark Python environment
 
 ```bash
 source /path/to/benchpark-venv/bin/activate
-
-which python
-which benchpark
-```
-
-Then install the extension:
-
-```bash
-cd ~/src/benchpark-container-extension
 python -m pip install .
 ```
 
-For extension development:
+For development:
 
 ```bash
 python -m pip install -e '.[test]'
@@ -219,255 +248,86 @@ benchpark container --help
 benchpark cer --help
 ```
 
-Installing the package into an unrelated Python environment can prevent Benchpark from discovering the extension entry points.
+## Quick start
 
----
+### Create a Catalog
 
-# Execution model
+```bash
+benchpark container catalog init \
+  "$HOME/benchpark-containers/personal" \
+  --name personal
 
-The responsibilities are intentionally separated.
-
-```text
-Benchpark Core
-      |
-      | generic external plugin seam
-      v
-Benchpark Container Extension
-      |
-      +-- System
-      |     +-- available runtimes
-      |     +-- default runtime
-      |     +-- platform
-      |     +-- GPU passthrough
-      |
-      +-- Experiment
-      |     +-- workload intent
-      |     +-- logical image/release selection
-      |     +-- run-local additions
-      |
-      +-- Container Catalog
-      |     +-- immutable logical releases
-      |     +-- retained SIF / OCI content
-      |
-      +-- Runtime backend
-      |     +-- Apptainer
-      |     +-- SingularityCE
-      |     +-- Docker
-      |
-      +-- CER
-            +-- resolved state
-            +-- observed state
-            +-- hardware/container provenance
-            +-- evidence hashes
-            +-- attempt result
+benchpark container catalog add \
+  "$HOME/benchpark-containers/personal" \
+  --name personal
 ```
 
-## System responsibility
-
-A System describes machine/runtime capability:
-
-- available container runtimes
-- runtime executable for each declared runtime
-- default runtime
-- Linux container platform
-- GPU passthrough mode
-- runtime cache/execution settings
-- artifact roots required by experiments
-
-A System does not own the reusable image inventory.
-
-## Experiment responsibility
-
-An Experiment describes benchmark intent:
-
-- workload and parameters
-- logical container image and immutable release
-- pinned requirements
-- setup scripts
-- mounts and environment
-- benchmark artifacts
-
-The Experiment is not tied to a single runtime when the selected Catalog release provides compatible runtime artifacts.
-
-## Catalog responsibility
-
-The Container Catalog owns reusable retained base environments:
-
-- logical image name
-- immutable release
-- platform
-- accelerator family
-- runtime bindings
-- retained SIF or OCI content
-- source provenance
-- managed artifact identity
-
----
-
-# Container Catalog
-
-The Catalog is more than a list of source URIs. Registration retains the artifact content used for later execution.
-
-The default visible registration file is:
+The default visible Catalog registration file is:
 
 ```text
 ~/benchpark-containers/catalogs.yaml
 ```
 
-A different registration file can be selected with:
+Override it with:
 
 ```bash
 export BPCE_CONFIG="$HOME/benchpark-containers/catalogs.yaml"
 ```
 
-## Create and register a Catalog
+### Register a SIF release
 
 ```bash
-benchpark container catalog init   "$HOME/benchpark-containers/personal"   --name personal
-
-benchpark container catalog add   "$HOME/benchpark-containers/personal"   --name personal
+benchpark container register \
+  --catalog personal \
+  --name common-base \
+  --release r1 \
+  --kind sif \
+  --source /absolute/path/to/common-base.sif \
+  --sha256 <SIF_SHA256> \
+  --platform linux/arm64 \
+  --accelerator nvidia \
+  --runtime apptainer \
+  --runtime singularity \
+  --python python3 \
+  --shell bash
 ```
 
-List registered Catalogs:
-
-```bash
-benchpark container catalog list
-```
-
-## Register a SIF release
-
-```bash
-benchpark container register   --catalog personal   --name common-base   --release r1   --kind sif   --source /absolute/path/to/common-base.sif   --sha256 <SIF_SHA256>   --platform linux/arm64   --accelerator nvidia   --runtime apptainer   --runtime singularity   --python python3   --shell bash
-```
-
-Inspect and validate:
+Inspect it:
 
 ```bash
 benchpark container list
 
-benchpark container show   personal:common-base   --release r1
+benchpark container show \
+  personal:common-base \
+  --release r1
 
-benchpark container validate   personal:common-base   --release r1
+benchpark container validate \
+  personal:common-base \
+  --release r1
 ```
 
-## Register an OCI release
+### Run a container-backed Experiment
+
+For an initialized container-capable System:
 
 ```bash
-benchpark container register   --catalog personal   --name common-docker-base   --release r1   --kind oci   --source registry.example.org/team/base@sha256:<SOURCE_DIGEST>   --platform linux/amd64   --accelerator nvidia   --runtime docker   --python python3   --shell bash
-```
-
-Managed OCI registration imports the required OCI content into filesystem-managed storage. Later execution uses the retained content instead of depending on a pre-existing Docker daemon image.
-
-An explicit tag may be accepted as registration input when the importer resolves it to an immutable digest during registration. Execution does not re-resolve the tag.
-
-Do not rely on an implicit `latest`.
-
-## Immutable releases
-
-`name + release` is immutable.
-
-For example:
-
-```text
-common-base / r1
-common-base / r2
-```
-
-If the base environment changes, create a new release rather than rewriting an existing release.
-
-## SIF retention
-
-A SIF is copied into managed content-addressed storage and verified by hash.
-
-```text
-source.sif
-   |
-   | register
-   v
-Managed Artifact Store
-   |
-   +-- retained SIF content
-```
-
-After successful registration, the original source path is provenance rather than a required execution dependency.
-
-## OCI identity
-
-For OCI, source identity and retained managed identity are distinct concepts:
-
-```text
-origin / source_digest    -> source provenance
-identity / stored_digest  -> retained managed representation
-```
-
-The extension verifies the integrity and closure of its managed OCI representation. It does not claim byte-for-byte or semantic equivalence between every possible source-registry representation and the normalized retained representation.
-
----
-
-# Runtime selection
-
-A System may expose multiple runtimes:
-
-```text
-available:
-  - apptainer
-  - singularity
-  - docker
-
-default:
-  apptainer
-```
-
-An Experiment may override the System default:
-
-```text
-Experiment A -> apptainer
-Experiment B -> docker
-Experiment C -> System default
-```
-
-Selection precedence is:
-
-```text
-explicit experiment container_runtime
-             |
-             v
-       selected runtime
-
-otherwise
-
-System default_runtime
-```
-
-If the selected runtime is unavailable, has an unexpected identity, or cannot use the selected artifact, execution fails explicitly.
-
-The extension does **not** silently fall back to another runtime.
-
----
-
-# Normal Benchpark / Ramble workflow
-
-Container support does not add a separate container-only setup workflow.
-
-Container use is selected in the Experiment specification:
-
-```bash
-benchpark experiment init   --dest=smoke-apptainer   /path/to/initialized-system   'common-base-smoke +container container_runtime=apptainer container_image=personal:common-base container_release=r1'
+benchpark experiment init \
+  --dest=smoke-apptainer \
+  /path/to/initialized-system \
+  'common-base-smoke +container container_runtime=apptainer container_image=personal:common-base container_release=r1'
 ```
 
 Then use the normal Benchpark workflow:
 
 ```bash
-benchpark setup   /path/to/initialized-system/smoke-apptainer   /path/to/runs
-```
+benchpark setup \
+  /path/to/initialized-system/smoke-apptainer \
+  /path/to/runs
 
-Load the generated environment:
-
-```bash
 source /path/to/runs/setup.sh
 ```
 
-Run the Ramble workspace:
+Run the generated Ramble workspace:
 
 ```bash
 WS=/path/to/runs/system/smoke-apptainer/workspace
@@ -477,135 +337,106 @@ ramble --workspace-dir "$WS" on
 ramble --workspace-dir "$WS" workspace analyze --formats json
 ```
 
-The execution flow remains:
+There is no separate `benchpark container setup` workflow.
+
+## Container Catalog and Managed Artifacts
+
+A Catalog release is immutable: `name + release` identifies one logical retained base environment.
+
+### SIF
+
+Registered SIF content is copied into managed storage and verified by hash.
+
+After successful registration, the original source path is provenance rather than an execution dependency.
+
+### OCI
+
+Managed OCI registration retains the required OCI content in filesystem-managed storage.
+
+An explicit mutable tag may be accepted as registration input only when it is resolved and pinned during registration. Execution does not silently re-resolve the tag.
+
+Do not rely on implicit `latest`.
+
+For OCI artifacts, source identity and retained identity are intentionally separate:
 
 ```text
-benchpark system init
-        |
-benchpark experiment init
-        |
-benchpark setup
-        |
-source <runs>/setup.sh
-        |
-ramble workspace setup
-        |
-ramble on
-        |
-ramble workspace analyze
+origin / source_digest    -> source provenance
+identity / stored_digest  -> retained managed artifact
 ```
 
-Experiments without `+container` remain on the native Benchpark / Spack path.
+## Run-local software additions
 
----
+The managed base artifact remains immutable.
 
-# Run-local environment
-
-Managed base containers are treated as immutable reusable bases.
-
-Experiment-specific additions are prepared separately for a run, including:
+Experiment-specific additions are prepared separately, including:
 
 ```text
 /bpce/python
 /bpce/tools
 ```
 
-The container's own declared Python, pip, and shell are used.
+The base environment's declared Python, pip, and shell are used.
 
-The extension does not inject an unrelated host Python environment into the container.
+Typical additions include pinned requirements, setup scripts, and benchmark helper tools.
 
-Typical run-local additions include:
-
-- pinned Python requirements
-- experiment setup scripts
-- benchmark-specific helper tools
-
-The managed base artifact remains unchanged.
-
-If an addition becomes stable and reusable across experiments, create a new base image and Catalog release.
-
----
-
-# Container Execution Record (CER)
+## Container Execution Record (CER)
 
 A CER records one concrete container execution attempt.
 
 Failed attempts are retained rather than overwritten.
 
-CER identity is split deliberately:
+### Identity
 
-- `condition_id` identifies the experiment condition
-- `plan_sha256` identifies the frozen execution plan
-- post-run collectors add evidence and observations without changing those identities
-- the final record hash covers the completed CER record
+CER separates frozen execution identity from post-run observations:
 
-## CER v1 collection
+- `condition_id` — experiment condition
+- `plan_sha256` — frozen execution plan
+- collector output — additive post-run observations/evidence
+- `record_sha256` — finalized CER record hash
 
-At run finalization, the extension executes independent collectors and merges their output additively into the CER.
+Collectors do not change `condition_id` or `plan_sha256`.
 
-Collectors must not overwrite an existing CER field. A collision or collector error is recorded as a collection error instead of silently replacing existing provenance.
+### Hardware provenance
 
-Collector failure is **non-fatal to the benchmark result**. For example, a benchmark that completed successfully remains `COMPLETED` even when a hardware probe fails. The CER reports collection status such as `partial` so the missing provenance is explicit.
+At finalization, the hardware collector records available host and accelerator information.
 
-## Host and hardware provenance
+For NVIDIA, `nvidia-smi` can provide:
 
-The hardware collector records host information and accelerator information when available.
-
-### NVIDIA
-
-When `nvidia-smi` is available, CER collection can record information such as:
-
-- GPU index
 - GPU UUID
 - PCI bus ID
 - GPU name
 - driver version
 - reported memory
-- a final post-execution state snapshot
+- final P-state/power-limit/clock observations when available
 
-The post-execution state may include values such as P-state, power limit, and current clocks when the driver exposes them.
+For AMD, the collector uses `amd-smi` JSON commands when available and falls back to `rocminfo` for accelerator identity when needed.
 
-### AMD
+Dynamic GPU values are **post-execution snapshots**, not time-series telemetry.
 
-When `amd-smi` is available, CER collection uses JSON-oriented commands including:
+### Container provenance
 
-```text
-amd-smi version --json
-amd-smi list --json
-amd-smi static --json
-amd-smi metric --json
-```
+The container collector summarizes the already-resolved/observed execution state, including:
 
-If `amd-smi` is unavailable, `rocminfo` can be used as a fallback for accelerator identity information.
-
-The collector is intended to work across AMD Instinct systems supported by the installed ROCm/AMD SMI stack; actual field availability depends on the installed driver/tool version and device.
-
-### Important: snapshot, not telemetry
-
-Dynamic fields collected by CER are **finalization-time observations**.
-
-They are not a time series and must not be interpreted as resource utilization during the benchmark.
-
-Continuous sampling of power, temperature, utilization, memory activity, clocks, or other performance/resource telemetry belongs to a separate profiling layer.
-
-## Container provenance
-
-The container collector summarizes the resolved and observed container execution state, including available information such as:
-
-- selected runtime and runtime version
+- runtime name/version
 - runtime executable identity
-- selected image kind and identity
-- logical Catalog image/release information
-- managed/unmanaged selection information
-- GPU passthrough mode inferred from the concrete execution
-- mount count
+- image kind/identity
+- logical Catalog image/release
+- managed selection information
+- GPU passthrough mode
+- mounts
 - declared execution-environment names
 
-The collector uses already-resolved/observed execution state rather than inventing a second independent runtime selection.
+### Collector failures
 
-## Evidence files
+Collector failures do not rewrite the benchmark verdict.
 
-Raw collector command output is retained under the run's CER evidence area, for example:
+A benchmark that completed successfully remains completed even if a provenance collector fails. The CER records the collection error and can report a partial collection state.
+
+Collectors are additive and cannot overwrite an existing CER field.
+
+### Evidence integrity
+
+Raw collector outputs are retained under the CER evidence area and included in the recorded file inventory with hashes.
 
 ```text
 cer-evidence/
@@ -614,104 +445,62 @@ cer-evidence/
     └── amd/
 ```
 
-Recorded evidence files are hashed and added to the CER file inventory.
-
-`benchpark cer validate` verifies the CER and recorded-file integrity and reports mismatches when recorded evidence has been modified after finalization.
-
-## CER commands
-
-List CERs:
-
-```bash
-benchpark cer list /path/to/workspace
-```
-
-Show one CER:
-
-```bash
-benchpark cer show /path/to/cer.json
-```
-
-Validate a CER and its recorded evidence:
+Validate a CER and its recorded evidence with:
 
 ```bash
 benchpark cer validate /path/to/cer.json
 ```
 
-Compare two CERs:
+Other CER commands:
 
 ```bash
-benchpark cer diff   /path/to/left/cer.json   /path/to/right/cer.json
-```
+benchpark cer list /path/to/workspace
+benchpark cer show /path/to/cer.json
 
-Export an existing CER:
+benchpark cer diff \
+  /path/to/left/cer.json \
+  /path/to/right/cer.json
 
-```bash
-benchpark cer export   /path/to/cer.json   --output /path/to/exported-cer.json
+benchpark cer export \
+  /path/to/cer.json \
+  --output /path/to/exported-cer.json
 ```
 
 CER validation establishes record/evidence integrity within the implemented scope. It does not claim scientific equivalence between benchmark runs.
 
----
+## Reproducibility boundaries
 
-# Reproducibility boundaries
+Within its managed scope, the extension is designed to preserve:
 
-Within its managed scope, the extension is designed to preserve these properties:
+- immutable Catalog releases
+- retained managed container content
+- explicit runtime selection
+- selected runtime/image identity
+- frozen condition/plan identity
+- run-local additions without base-image mutation
+- separate successful and failed attempts
+- additive CER observations
+- hashed evidence
+- native Benchpark behavior when `+container` is absent
 
-- existing Catalog `name + release` entries are immutable
-- execution uses retained managed content instead of silently re-resolving a mutable source
-- runtime selection is explicit and recorded
-- selected image identity and Catalog release are recorded
-- run-local additions do not modify the managed base artifact
-- successful and failed attempts can coexist in CER history
-- collector output does not rewrite the frozen condition or plan identity
-- collector failures are visible instead of being silently ignored
-- recorded CER evidence is hashed
-- experiments without `+container` remain on the native Benchpark path
+The extension does not by itself guarantee:
 
-The extension does **not** by itself guarantee:
-
-- identical performance across hardware
+- identical performance across machines
+- scientific equivalence between runs
 - identical behavior across different container images
-- scientific equivalence between two runs
-- permanent availability of external package repositories
-- registry authentication
+- external package/registry availability
 - third-party licensing rights
 - container signature verification
-- Managed Artifact Store backup
-- protection from storage failure or administrator deletion
-- site-specific scheduler/GPU configuration
+- managed-store backup
+- site scheduler/GPU configuration
 - continuous resource telemetry
-- benchmark tuning
+- automatic benchmark tuning
 
-Storage capacity, backup, retention, authentication, licensing, and site security remain operational responsibilities.
-
----
-
-# Generic examples
-
-The public repository contains only generic Container Extension examples.
-
-`tools/configure_examples.py` can create a separate Benchpark configuration scope for those examples without copying the extension implementation into the upstream Benchpark source tree.
-
-For example:
-
-```bash
-python tools/configure_examples.py   /path/to/benchpark   /tmp/bpce-example-scope   --bootstrap /path/to/benchpark-bootstrap
-```
-
-A generic System can then declare the available runtimes and a generic smoke Experiment can select a Catalog image/release.
-
-AI benchmark/model definitions are intentionally outside this repository.
-
----
-
-# Development and validation
+## Development and validation
 
 Install development dependencies:
 
 ```bash
-source /path/to/benchpark-venv/bin/activate
 python -m pip install -e '.[test]'
 ```
 
@@ -727,9 +516,7 @@ Run tests appropriate for the current host:
 python -m pytest -q
 ```
 
-Some runtime/GPU acceptance tests require the corresponding Linux runtime, driver, image, or benchmark environment. A non-Linux development host is not a substitute for Linux runtime acceptance.
-
-Verify the packaged runtime worker:
+Check the packaged runtime worker:
 
 ```bash
 python tools/build_runtime.py --check
@@ -744,29 +531,20 @@ python tools/audit_architecture.py
 Build a wheel:
 
 ```bash
-python -m pip wheel . --no-deps -w /tmp/bpce-wheel
+python -m pip wheel . \
+  --no-deps \
+  -w /tmp/bpce-wheel
 ```
 
-When testing against a Benchpark checkout, generate a fresh integration patch for that checkout:
+Some runtime/GPU acceptance tests require the corresponding Linux runtime, driver, image, and benchmark environment. Host-side tests on another OS are not a substitute for Linux runtime acceptance.
 
-```bash
-python tools/patch_core.py   /path/to/benchpark   --output /tmp/bpce-core.patch
-
-git -C /path/to/benchpark apply --stat /tmp/bpce-core.patch
-git -C /path/to/benchpark apply --check /tmp/bpce-core.patch
-```
-
-Do not edit generated Benchpark/Ramble workspace files to change experiment intent. Change the System or Experiment source definition and initialize a new instance.
-
----
-
-# License
+## License
 
 Licensed under the Apache License, Version 2.0.
 
 See `LICENSE` and `NOTICE`.
 
----
+-----
 
 # Acknowledgments
 
