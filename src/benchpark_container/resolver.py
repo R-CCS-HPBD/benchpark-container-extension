@@ -11,7 +11,11 @@ from .image_selection import select_image, select_runtime
 from .contracts import (base_tools, validate_targets, PREPARATION_POLICY,
                         preparation_needs, validate_environment)
 from .artifacts import pin_external_artifacts
-from .artifact_mapping import load_artifact_mapping, resolve_artifact_reference
+from .artifact_mapping import (
+    expand_variant_template,
+    load_artifact_mapping,
+    resolve_artifact_reference,
+)
 from .provenance import source_provenance
 from .reproducibility import validate_inputs
 from .util import ValidationError, check_no_secrets, inside, safe_name, sha256, strict
@@ -187,6 +191,14 @@ def resolve(context):
 
             mapped_revision = mapped.get("revision")
             requested_revision = a.get("revision")
+
+            if requested_revision is not None:
+                requested_revision = expand_variant_template(
+                    requested_revision,
+                    variants,
+                    field="artifact revision",
+                )
+                b["revision"] = requested_revision
 
             if (
                 mapped_revision is not None

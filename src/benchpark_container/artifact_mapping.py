@@ -40,6 +40,46 @@ _ARTIFACT_ID = re.compile(
 
 _TEMPLATE_VARIABLE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
+
+def expand_variant_template(template, variants, field="value"):
+    """Expand a scalar {variant} template to exactly one concrete value."""
+    if not isinstance(template, str) or not template:
+        raise ValidationError(
+            "%s must be a non-empty string" % field
+        )
+
+    def replace(match):
+        name = match.group(1)
+        values = variants.get(name)
+
+        if (
+            not isinstance(values, (list, tuple))
+            or len(values) != 1
+        ):
+            raise ValidationError(
+                "%s template variable must resolve to exactly one "
+                "Experiment variant: %s" % (field, name)
+            )
+
+        value = values[0]
+
+        if not isinstance(value, (str, int)):
+            raise ValidationError(
+                "%s template variable must be scalar: %s"
+                % (field, name)
+            )
+
+        return str(value)
+
+    expanded = _TEMPLATE_VARIABLE.sub(replace, template)
+
+    if "{" in expanded or "}" in expanded:
+        raise ValidationError(
+            "Unresolved %s template: %s" % (field, expanded)
+        )
+
+    return expanded
+
 _ENTRY_KEYS = {
     "path",
     "kind",
