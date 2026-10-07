@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "benchpark-container-extension"
-version = "1.0.0.dev8"
+version = "1.0.0.dev9"
 description = "External Common Base Container execution and per-run CER for Benchpark"
 readme = "README.md"
 requires-python = ">=3.10"
