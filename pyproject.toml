@@ -4,12 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "benchpark-container-extension"
-version = "1.0.0.dev7"
+version = "1.0.0.dev8"
 description = "External Common Base Container execution and per-run CER for Benchpark"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
 dependencies = ["PyYAML==6.0.3", "packaging==25.0"]
+
+[project.optional-dependencies]
+test = ["pytest==9.0.2", "setuptools==82.0.1"]
 
 [project.entry-points."benchpark.extensions"]
 container = "benchpark_container.plugin:describe"
@@ -26,6 +29,11 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 benchpark_container = ["resources/**/*", "resources/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = ["runtime: requires a real container runtime and a supplied Common Base image", "upstream: requires a local real Benchpark checkout and Ramble"]
 
 [tool.setuptools.exclude-package-data]
 "*" = ["**/__pycache__/*", "**/*.pyc", "**/*.pyo"]

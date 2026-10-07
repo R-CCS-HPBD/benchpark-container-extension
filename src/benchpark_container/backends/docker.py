@@ -23,7 +23,7 @@ class DockerBackend(OCIRuntimeBackend):
         unknown = set(options) - allowed
         if unknown:
             raise ValidationError('Unknown Docker backend_options: ' + ', '.join(sorted(unknown)))
-        endpoint = options.get('endpoint', 'unix:///var/run/docker.sock')
+        endpoint = options.get('endpoint') or os.environ.get('DOCKER_HOST') or 'unix:///var/run/docker.sock'
         if (not isinstance(endpoint, str) or not endpoint.startswith('unix:///')
                 or any(c in endpoint for c in '\n\r\x00')
                 or '..' in PurePosixPath(endpoint[7:]).parts):
@@ -59,7 +59,14 @@ class DockerBackend(OCIRuntimeBackend):
     def __init__(self, settings):
         super().__init__(settings)
         self.options = dict(self.settings.get('backend_options', {}))
-        self.endpoint = self.options.get('endpoint', 'unix:///var/run/docker.sock')
+        # Resolve the effective local Docker endpoint once, then freeze it.
+        # Ambient Docker client settings are not allowed to redirect later
+        # runtime commands after backend construction.
+        self.endpoint = (
+            self.options.get('endpoint')
+            or os.environ.get('DOCKER_HOST')
+            or 'unix:///var/run/docker.sock'
+        )
         self.private_config = None
         configured = self.options.get('config_dir')
         if configured:
@@ -76,6 +83,7 @@ class DockerBackend(OCIRuntimeBackend):
             self.config_dir = Path(self.private_config.name)
             (self.config_dir / 'config.json').write_text('{}\n')
         self.daemon = None
+        self.rootless = False
 
     def cli(self):
         # --host and --config prevent environment/currentContext from selecting
@@ -99,10 +107,32 @@ class DockerBackend(OCIRuntimeBackend):
         if not isinstance(info, dict) or info.get('OSType') != 'linux':
             raise ValidationError('This backend requires a local Linux Docker Engine')
         security = info.get('SecurityOptions') or []
-        if any('rootless' in str(v) or 'userns' in str(v) for v in security):
-            raise ValidationError('Rootless/userns-remapped Docker is not validated for host UID/GID bind ownership; use the documented rootful local backend')
-        self.daemon = {key: info[key] for key in ('ID', 'Name', 'ServerVersion', 'OSType', 'Architecture', 'SecurityOptions') if key in info}
-        result.update(endpoint=self.endpoint, daemon=self.daemon)
+        self.rootless = any('rootless' in str(v) for v in security)
+        userns_remap = any('userns' in str(v) for v in security) and not self.rootless
+
+        if userns_remap:
+            raise ValidationError(
+                'userns-remapped Docker is not validated for host bind ownership'
+            )
+
+        self.daemon = {
+            key: info[key]
+            for key in (
+                'ID',
+                'Name',
+                'ServerVersion',
+                'OSType',
+                'Architecture',
+                'SecurityOptions',
+            )
+            if key in info
+        }
+
+        result.update(
+            endpoint=self.endpoint,
+            mode='rootless' if self.rootless else 'rootful',
+            daemon=self.daemon,
+        )
         return result
 
     def _cuda(self, environment):
@@ -148,15 +178,39 @@ class DockerBackend(OCIRuntimeBackend):
         return args
 
     def create_options(self, request, environment):
-        args = ['--user', str(os.getuid()) + ':' + str(os.getgid()),
-                '--network', self.options.get('network', 'bridge'), '--ipc', self.options.get('ipc', 'private')]
+        args = [
+            '--network',
+            self.options.get('network', 'bridge'),
+            '--ipc',
+            self.options.get('ipc', 'private'),
+        ]
+
+        # Rootful Docker needs the host UID/GID explicitly so bind-mounted
+        # output remains owned by the invoking user. Rootless Docker maps
+        # container root to the invoking host user, so passing host UID/GID
+        # inside the user namespace is incorrect and can make bind mounts
+        # unwritable.
+        if not self.rootless:
+            args[0:0] = [
+                '--user',
+                str(os.getuid()) + ':' + str(os.getgid()),
+            ]
         if self.options.get('ipc', 'private') != 'host':
             args += ['--shm-size', str(self.options.get('shm_size', '64m'))]
         if 'cgroup_parent' in self.options:
             args += ['--cgroup-parent', self.options['cgroup_parent']]
         if self.options.get('seccomp', 'default') == 'unconfined':
             args += ['--security-opt', 'seccomp=unconfined']
-        groups = self.options.get('group_add', sorted(set(os.getgroups())))
+        if self.rootless and self.options.get('group_add'):
+            raise ValidationError(
+                'group_add is not supported by the validated rootless Docker mode'
+            )
+
+        groups = (
+            []
+            if self.rootless
+            else self.options.get('group_add', sorted(set(os.getgroups())))
+        )
         for group in groups:
             args += ['--group-add', str(group)]
         if request.accelerator == 'nvidia':
