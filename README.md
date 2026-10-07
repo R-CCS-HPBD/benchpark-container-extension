@@ -97,9 +97,10 @@ A System describes what the machine can execute:
 - Linux container platform
 - GPU passthrough mode
 - runtime cache/execution settings
-- artifact roots required by experiments
 
-A System does not own the reusable image inventory.
+A System does not own reusable image inventory or user/site-specific model and
+dataset locations. External artifact placement is resolved independently through
+Artifact Mapping.
 
 ### Experiment
 
@@ -111,8 +112,60 @@ An Experiment describes what should be executed:
 - setup scripts
 - mounts and environment
 - benchmark input/output artifacts
+- logical external artifact IDs such as `datasets:cifar10` or
+  `models:qwen3-0.6b`
 
 Container use is selected by adding `+container` to the normal Experiment specification.
+
+### Artifact Mapping
+
+External datasets, model weights, and similar user/site artifacts are resolved
+separately from the Benchpark System.
+
+An Experiment declares a logical artifact requirement:
+
+```python
+{
+    "name": "dataset",
+    "kind": "workload",
+    "artifact": "datasets:{workload}",
+    "target": "/workload/cifar10",
+}
+```
+
+The physical host location is supplied by an Artifact Mapping file:
+
+```yaml
+schema_version: 1
+artifacts:
+  datasets:cifar10:
+    path: /data/artifacts/datasets/cifar10
+    kind: workload
+
+  models:qwen3-0.6b:
+    path: /shared/models/qwen3-0.6b
+    kind: model
+    revision: e6de...
+```
+
+Select the mapping with:
+
+```bash
+export BPCE_ARTIFACT_CONFIG=/absolute/path/to/artifact-mapping.yaml
+```
+
+Artifact paths must be absolute. Logical inputs are mounted read-only. A mapping
+may optionally declare `kind` and `revision`; incompatible declarations fail
+closed.
+
+Existing Systems using `artifact_roots` remain supported as a legacy
+compatibility path. New Systems should not encode user/site-specific model or
+dataset locations.
+
+The resolved execution plan records the logical artifact ID, mapping source and
+mapping-file SHA256, resolved external path, mount target, and pinned input
+identity. CER finalization verifies the mounted content and records the observed
+file/tree identity.
 
 ### Container Catalog
 
@@ -418,6 +471,9 @@ The container collector summarizes the already-resolved/observed execution state
 - GPU passthrough mode
 - mounts
 - declared execution-environment names
+- logical external artifact IDs and resolved paths
+- Artifact Mapping source and mapping-file SHA256
+- pinned and observed external artifact file/tree hashes
 
 ### Collector failures
 
@@ -471,6 +527,9 @@ Within its managed scope, the extension is designed to preserve:
 - selected runtime/image identity
 - frozen condition/plan identity
 - run-local additions without base-image mutation
+- logical external artifact selection independently of System
+- Artifact Mapping provenance
+- pinned and observed external artifact content identity
 - separate successful and failed attempts
 - additive CER observations
 - hashed evidence

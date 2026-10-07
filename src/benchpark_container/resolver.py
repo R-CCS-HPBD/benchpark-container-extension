@@ -11,6 +11,7 @@ from .image_selection import select_image, select_runtime
 from .contracts import (base_tools, validate_targets, PREPARATION_POLICY,
                         preparation_needs, validate_environment)
 from .artifacts import pin_external_artifacts
+from .artifact_mapping import load_artifact_mapping, resolve_artifact_reference
 from .provenance import source_provenance
 from .reproducibility import validate_inputs
 from .util import ValidationError, check_no_secrets, inside, safe_name, sha256, strict
@@ -116,13 +117,21 @@ def resolve(context):
     source_snapshot = capture_for_experiment(root, context.name)
     resources = list(source_snapshot.resources) if source_snapshot else []
     artifacts, targets, names = [], set(), set()
+
+    # New primary path: logical artifact IDs are resolved independently of
+    # Benchpark System through BPCE_ARTIFACT_CONFIG.
+    artifact_mapping, artifact_mapping_provenance = load_artifact_mapping()
+
+    # Legacy compatibility only. Existing Systems that still provide
+    # artifact_roots continue to work, but new Systems do not place user/site
+    # model or dataset locations in System.
     roots = s.get("artifact_roots", {})
     for name, path in roots.items():
         safe_name(name, "artifact root")
         if not Path(path).is_absolute():
             raise ValidationError("System artifact root must be absolute")
     for a in q.get("artifacts", []):
-        strict(a, ("name", "kind", "root", "path", "source", "target", "readonly", "sha256", "revision", "manifest", "manifest_sha256"),
+        strict(a, ("name", "kind", "artifact", "root", "path", "source", "target", "readonly", "sha256", "revision", "manifest", "manifest_sha256"),
                "artifact", ("name", "kind", "target"))
         name = safe_name(a["name"], "artifact name")
         target = a["target"]
@@ -136,13 +145,18 @@ def resolve(context):
         targets.add(target); names.add(name)
         b = dict(a)
         if a["kind"] in ("result", "log", "temporary", "cache"):
-            if any(key in a for key in ("root", "path", "source")):
+            if any(key in a for key in ("artifact", "root", "path", "source")):
                 raise ValidationError("Writable artifacts use private per-attempt directories")
             if a.get("readonly", False):
                 raise ValidationError("Output cannot be read-only")
             b.update(readonly=False, location="attempt")
         elif "source" in a:
-            if "root" in a or "path" in a or a.get("readonly", True) is not True:
+            if (
+                "artifact" in a
+                or "root" in a
+                or "path" in a
+                or a.get("readonly", True) is not True
+            ):
                 raise ValidationError("Fixed source artifact must be read-only")
             p = inside(root, a["source"], must_exist=True)
             if not p.is_file():
@@ -152,12 +166,83 @@ def resolve(context):
                 raise ValidationError("Source artifact checksum mismatch")
             resources.append(res)
             b.update(readonly=True, location="resource", resource=res.target, sha256=res.sha256)
+        elif "artifact" in a:
+            if (
+                "root" in a
+                or "path" in a
+                or "source" in a
+                or a.get("readonly", True) is not True
+            ):
+                raise ValidationError(
+                    "Logical artifact input cannot also declare root/path/source "
+                    "and must be read-only"
+                )
+
+            logical_id, mapped = resolve_artifact_reference(
+                a["artifact"],
+                variants,
+                artifact_mapping,
+                a["kind"],
+            )
+
+            mapped_revision = mapped.get("revision")
+            requested_revision = a.get("revision")
+
+            if (
+                mapped_revision is not None
+                and requested_revision is not None
+                and mapped_revision != requested_revision
+            ):
+                raise ValidationError(
+                    "Artifact revision mismatch for %s" % logical_id
+                )
+
+            mapped_path = Path(mapped["path"])
+
+            b["artifact"] = logical_id
+
+            if requested_revision is None and mapped_revision is not None:
+                b["revision"] = mapped_revision
+
+            b.update(
+                readonly=True,
+                location="external",
+                host_root=str(mapped_path.parent),
+                path=mapped_path.name,
+            )
+
+            if artifact_mapping_provenance is not None:
+                b["artifact_mapping_source"] = (
+                    artifact_mapping_provenance["source"]
+                )
+                b["artifact_mapping_sha256"] = (
+                    artifact_mapping_provenance["sha256"]
+                )
+
         else:
-            if a.get("root") not in roots or "path" not in a or a.get("readonly", True) is not True:
-                raise ValidationError("Input requires a known System root, relative path and read-only mode")
-            if Path(a["path"]).is_absolute() or ".." in Path(a["path"]).parts:
+            # Legacy compatibility for existing root/path declarations.
+            if (
+                a.get("root") not in roots
+                or "path" not in a
+                or a.get("readonly", True) is not True
+            ):
+                raise ValidationError(
+                    "Input requires either a mapped logical artifact or a "
+                    "legacy known System root, relative path and read-only mode"
+                )
+
+            if (
+                Path(a["path"]).is_absolute()
+                or ".." in Path(a["path"]).parts
+            ):
                 raise ValidationError("Input path escapes its System root")
-            b.update(readonly=True, location="external", host_root=roots[a["root"]])
+
+            b.update(
+                readonly=True,
+                location="external",
+                host_root=roots[a["root"]],
+            )
+
         artifacts.append(b)
     validate_targets(artifacts, image["tools"].values())
     artifacts = pin_external_artifacts(artifacts, variants)
