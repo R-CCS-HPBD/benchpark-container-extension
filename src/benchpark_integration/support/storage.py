@@ -79,6 +79,9 @@ def publish_experiment(values, destdir, system_dir, upstream_root=None):
         "modifier_repositories": list(dict.fromkeys(r for c in values for r in c.modifier_repositories)),
         "config_sha256": file_hash(dest / "ramble.yaml"),
         "payload_sha256": {c.owner: digest(c.payload) for c in values}}
+    application_repositories = list(dict.fromkeys(r for c in values for r in c.application_repositories))
+    if application_repositories:
+        manifest["application_repositories"] = application_repositories
     write_new_json(state / "manifest.json", manifest)
 
 def verify_manifest(source):
@@ -146,6 +149,20 @@ def stage_workspace(source, configs, system_source, copier, include_fn):
         repos = [str(workspace / STATE_DIR / "resources" / relative_path(r))
                  for r in data["modifier_repositories"]]
         p.write_text(yaml.safe_dump({"modifier_repos": repos}), encoding="utf-8")
+    # Workspace-scoped application definitions take precedence over the live
+    # registered repository. Existing experiments never reread updated app code.
+    if data.get("application_repositories"):
+        import yaml
+        p = Path(configs) / "repos.yaml"
+        config = yaml.safe_load(p.read_text()) if p.exists() else {}
+        config = config or {}
+        current = config.get("repos", [])
+        if not isinstance(current, list):
+            raise ExtensionError("Workspace application repos must be a list")
+        frozen = [str(workspace / STATE_DIR / "resources" / relative_path(r))
+                  for r in data["application_repositories"]]
+        config["repos"] = list(dict.fromkeys(frozen + current))
+        p.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
     return True
 
 def copy_template(source, target, experiment_source):

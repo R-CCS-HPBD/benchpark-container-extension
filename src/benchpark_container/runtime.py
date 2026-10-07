@@ -3,8 +3,8 @@
 
 Design boundary:
 - Benchpark/Extension provides declarations and immutable input artifacts.
-- The Common Base Container provides Python, pip and every package-management
-  executable used to construct the run-local software layer.
+- The Base Container supplies Bash and the tools needed by declared preparation.
+  Python/pip are required only by the corresponding Python preparation work.
 - The extension NEVER injects a Python interpreter, pip, package manager or
   installer binary into the container.
 - Optional command/tool installation is expressed as source-controlled shell
@@ -30,7 +30,9 @@ from .util import (ValidationError, atomic_json, check_no_secrets, identity,
 from .artifacts import materialize
 from .reproducibility_rules import validate_model_artifacts, canonical
 from .cer.recording import start_run, finish_run
-from .contracts import (runtime_settings, validate_targets, ROOT, INPUTS, WORK, BENCHMARK_SCRIPT)
+from .cer.source_evidence import retain_source_evidence
+from .contracts import (runtime_settings, validate_targets, validate_accelerator_contract,
+                        validate_preparation, validate_environment, ROOT, INPUTS, WORK, BENCHMARK_SCRIPT)
 from .preparation import prepare_environment, EnvironmentBuildError, validate_layer_inventory, dependency_check_delta
 
 
@@ -60,8 +62,11 @@ def concrete_plan(plan, variables, command, experiment="unknown", repeat="unknow
             raise ValidationError("Missing exported measurement variable: " + key)
         parameters[key] = variables[key]
     data["parameters"] = parameters
+    validate_accelerator_contract(data)
+    needs = validate_preparation(data)
     data["artifacts"] = expand(data["artifacts"], parameters)
     data["environment"] = expand(data["environment"], parameters)
+    validate_environment(data["environment"], needs["python"])
     validate_targets(data["artifacts"], data["base"].get("tools", {}).values(), concrete=True)
     models = validate_model_artifacts(data["artifacts"])
     data.setdefault("validation", {})["concrete_models"] = models
@@ -71,7 +76,7 @@ def concrete_plan(plan, variables, command, experiment="unknown", repeat="unknow
     # Exclude record-only location/repeat values from condition identity.
     scientific = {k: data[k] for k in ("benchmark", "base", "runtime", "requirements",
         "setup_scripts", "artifacts", "parameters", "resources", "environment", "command",
-        "dependency_policy", "provenance", "protected_packages", "smoke_imports") if k in data}
+        "dependency_policy", "provenance", "protected_packages", "smoke_imports", "benchmark_content_sha256") if k in data}
     for key in ("n_repeats", "repeat_index", "experiment_run_dir"):
         scientific["parameters"] = {k: v for k, v in scientific["parameters"].items() if k != key}
     data["condition_id"] = identity(scientific)
@@ -148,6 +153,9 @@ def execute(spec, resources, run_root):
         for signum in (signal.SIGTERM, signal.SIGINT):
             old_handlers[signum] = signal.signal(signum, interrupted)
     try:
+        validate_accelerator_contract(spec)
+        needs = validate_preparation(spec)
+        validate_environment(spec["environment"], needs["python"])
         timeout = float(spec["timeout_seconds"])
         if not 0 < timeout <= 7 * 86400:
             raise ValidationError("Invalid timeout_seconds")
@@ -155,6 +163,9 @@ def execute(spec, resources, run_root):
             p = inside(resources, relative, must_exist=True)
             if sha256(p) != expected:
                 raise ValidationError("Fixed resource has changed: " + relative)
+        source = retain_source_evidence(resources, attempt, spec)
+        if source is not None:
+            record["observed"]["benchmark_source"] = source
         expected = spec["base"].get("platform", "unverified")
         architecture = record["observed"]["host"]["machine"]
         native = {"x86_64": "linux/amd64", "aarch64": "linux/arm64"}.get(architecture)

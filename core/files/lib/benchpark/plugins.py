@@ -118,3 +118,63 @@ def print_extension_help():
         print("\nInstalled external commands: " + ", ".join(names))
     if features:
         print("Installed experiment features: " + ", ".join("+" + n for n in features))
+
+
+def repository_config(repositories, config_dir):
+    """Generic data-only repository contribution port; no Core config writes."""
+    candidates = entries("benchpark.repositories.v1")
+    if not candidates:
+        return repositories
+    # JSON copying prevents a failing provider from mutating native config.
+    result = json.loads(json.dumps(repositories, allow_nan=False))
+    for name, matches in sorted(candidates.items()):
+        if len(matches) != 1:
+            raise PluginError("Conflicting repository providers: " + name)
+        provider = _load(matches[0])
+        try:
+            result = provider.handle("repositories", {
+                "repositories": result, "config_dir": str(config_dir)})
+            if not isinstance(result, dict):
+                raise ValueError("Repository provider must return a mapping")
+            result = json.loads(json.dumps(result, allow_nan=False))
+        except Exception as exc:
+            raise PluginError("Repository provider %s: %s" % (name, exc)) from exc
+    return result
+
+def repository_entries(kind, directory, include_external=True):
+    """Optional external object directories for native accounting/list loops."""
+    result = [[p.name, str(directory)] for p in sorted(Path(directory).iterdir())]
+    if not include_external: return [(name, Path(parent)) for name, parent in result]
+    for name, matches in sorted(entries("benchpark.repositories.v1").items()):
+        if len(matches) != 1:
+            raise PluginError("Conflicting repository providers: " + name)
+        try:
+            result = _load(matches[0]).handle("repository_entries", {
+                "kind": kind, "entries": result})
+            if not isinstance(result, list) or not all(
+                    isinstance(x, (tuple, list)) and len(x) == 2 and
+                    all(isinstance(v, str) for v in x) for x in result):
+                raise ValueError("Repository entries must be name/path pairs")
+        except Exception as exc:
+            raise PluginError("Repository provider %s: %s" % (name, exc)) from exc
+    return [(name, Path(parent)) for name, parent in result]
+def repository_list_groups(kind, collection, native_benchmarks=()):
+    """Partition accounting output for presentation; resolution stays unified."""
+    if kind not in ("benchmarks", "experiments"):
+        raise PluginError("Unsupported repository list kind: " + str(kind))
+    original, claimed, groups = list(collection), set(), []
+    for name, matches in sorted(entries("benchpark.repositories.v1").items()):
+        if len(matches) != 1:
+            raise PluginError("Conflicting repository providers: " + name)
+        try:
+            group = _load(matches[0]).handle("repository_list_group", {"kind": kind, "collection": list(original), "native_benchmarks": list(native_benchmarks)})
+            if group is None: continue
+            if not isinstance(group, dict) or set(group) != {"label", "items"}: raise ValueError("Repository list group must contain label/items")
+            label, items = group["label"], group["items"]
+            if not isinstance(label, str) or not label.strip() or not isinstance(items, list) or not all(isinstance(x, str) for x in items): raise ValueError("Invalid repository list group")
+            if len(items) != len(set(items)) or any(x not in original for x in items) or claimed.intersection(items): raise ValueError("Repository list group contains duplicate/unknown/claimed items")
+            claimed.update(items)
+            if items: groups.append((label.strip(), items))
+        except Exception as exc:
+            raise PluginError("Repository provider %s: %s" % (name, exc)) from exc
+    return [item for item in original if item not in claimed], groups

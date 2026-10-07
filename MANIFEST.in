@@ -1,9 +1,12 @@
-include LICENSE NOTICE README.md CHANGELOG.md
+include LICENSE
+include NOTICE
+include README.md
+
 recursive-include core *.py
-recursive-include tools *.py
-recursive-include docs *.md *.json
-recursive-include examples *.py *.yaml *.json *.txt *.md *.sh
-recursive-include tests *.py *.yaml *.json *.txt *.md *.zip *.sh *.tpl
+include tools/patch_core.py
+
 recursive-include src/benchpark_container/resources *
-global-exclude __pycache__ *.py[cod]
-recursive-include results *.md *.json *.log *.patch *.txt
+
+global-exclude __pycache__
+global-exclude *.pyc
+global-exclude *.pyo

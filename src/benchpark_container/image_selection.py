@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """System capability + instance selection + immutable image request resolution."""
 from pathlib import Path
-from .contracts import runtime_settings, base_tools
+from .contracts import runtime_settings, container_tools
 from .util import ValidationError, strict, safe_name, identity
 from .reproducibility import pin_image
 from .catalog.manager import lookup, fixed_release
@@ -67,18 +67,28 @@ def select_image(system, request, variants, runtime):
     if isinstance(name, dict):
         # Explicit non-managed definition is retained as a development option,
         # never misrepresented as Catalog-preserved or used as a fallback.
-        strict(name, ('uri', 'tools', 'sha256', 'platform', 'managed'), 'direct image', ('uri', 'tools', 'managed'))
+        strict(name, ('uri', 'tools', 'sha256', 'platform', 'managed', 'accelerator'), 'direct image', ('uri', 'tools', 'managed'))
         if name['managed'] is not False:
             raise ValidationError('Direct images must explicitly declare managed=False; register for retention')
         image = pin_image(name)
-        image['tools'] = base_tools(name['tools'])
+        image['tools'] = container_tools(name['tools'])
         if image['kind'] not in backend_class(runtime['runtime']).capabilities.image_kinds:
             raise ValidationError('Selected runtime does not support this image kind')
         if image.get('platform', 'unverified') not in ('unverified', system['platform']):
             raise ValidationError('Direct image platform mismatch')
+        accelerator = name.get('accelerator')
+        if accelerator is not None and accelerator not in ('none', 'nvidia', 'amd'):
+            raise ValidationError('Unknown direct image accelerator family')
+        if runtime['gpu'] != 'none' and accelerator is None:
+            raise ValidationError('Direct GPU image must declare accelerator=nvidia or accelerator=amd')
+        if accelerator is not None and runtime['gpu'] != 'none' and accelerator != runtime['gpu']:
+            raise ValidationError('Direct image accelerator does not match System GPU policy')
         image.update(logical_name='direct', release=release)
+        if accelerator is not None:
+            image['accelerator'] = accelerator
         return image, {'source': 'experiment-direct', 'managed': False, 'release': release,
-                       'selection_origin': image_origin, 'warning': 'image bytes are not retained by Catalog'}
+                       'accelerator': accelerator, 'selection_origin': image_origin,
+                       'warning': 'image bytes are not retained by Catalog'}
     if not isinstance(name, str):
         raise ValidationError('default_image must be a catalog name or explicit direct-image declaration')
     alias, catalog, entry = lookup(name, release)
@@ -98,6 +108,7 @@ def select_image(system, request, variants, runtime):
         raise ValidationError('Catalog must resolve exactly one platform/accelerator/runtime image binding')
     artifact = candidates[0]
     image = catalog.image(artifact)
+    image['tools'] = container_tools(image['tools'])
     verify_managed(image)
     if image['kind'] == 'oci':
         image['managed']['skopeo'] = read_config()['skopeo']
@@ -107,4 +118,4 @@ def select_image(system, request, variants, runtime):
                    'catalog_id': catalog.header['catalog_id'], 'catalog_root': str(catalog.root),
                    'catalog_provenance': provenance, 'entry_sha256': entry['entry_sha256'],
                    'entry_snapshot': entry, 'name': entry['name'], 'release': release,
-                   'selection_origin': image_origin}
+                   'accelerator': artifact['accelerator'], 'selection_origin': image_origin}

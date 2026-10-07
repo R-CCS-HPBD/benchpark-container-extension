@@ -1,1 +1,0 @@
-CIの静的検査専用。digestはテスト用で、実imageの存在を主張しない。ネットワーク/pull/Container実行は行わない。モデルはsynthetic smokeのため外部model artifactなし。

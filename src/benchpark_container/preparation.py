@@ -3,7 +3,8 @@
 
 The host only launches the declared container runtime.  Every software action
 below executes *inside the Common Base container* using the Base's declared
-Python/pip/Bash.  The extension does not inject Python, pip, a resolver, a
+Bash and any tools needed by the declared work. The extension does not inject
+Python, pip, a resolver, a
 package-manager binary, or a venv bootstrap.
 """
 import hashlib
@@ -18,7 +19,8 @@ import time
 from .util import ValidationError, atomic_json
 from .backends.base import command_scope
 from .reproducibility_rules import canonical
-from .contracts import (base_tools, validate_targets, DEPENDENCY_POLICY, ROOT, INPUTS,
+from .contracts import (base_tools, container_tools, executable_value, validate_targets,
+                        validate_preparation, validate_environment, DEPENDENCY_POLICY, ROOT, INPUTS,
                         PYTHON_PREFIX, TOOLS_PREFIX, WORK)
 from .artifacts import tree_identity
 
@@ -166,44 +168,61 @@ def _inspect(rt, image, scratch, inputs, mounts, python, modules, timeout,
                     log_stem or (Path(scratch).parent / 'inspection'), require_json=True)
 
 
-_TOOL_PROBE = r'''
-import json, os, shutil, sys
-shell = shutil.which(sys.argv[1])
-if shell is None:
-    raise RuntimeError("Declared Base Bash not found: " + sys.argv[1])
-print(json.dumps({"python": sys.executable, "shell": os.path.abspath(shell),
+_SHELL_PROBE = r"""
+test -n "${BASH_VERSION:-}" || exit 2
+set -euo pipefail
+printf '%s\0%s\0%s\0' "$BASH" "$BASH_VERSION" "${PATH-}"
+"""
+
+_TOOL_PROBE = r"""
+import json, sys
+print(json.dumps({"python": sys.executable,
                   "python_version": list(sys.version_info[:3])}))
-'''
+"""
 
 
-def preflight_tools(rt, image, scratch, inputs, mounts, requested, timeout, environment, attempt):
+def preflight_shell(rt, image, scratch, inputs, mounts, requested, timeout, environment, attempt):
+    """Probe the declared Bash with Bash itself; no interpreter injection."""
+    shell = container_tools(requested)['shell']
+    validate_targets(mounts, (shell,), concrete=True)
+    proc, _ = _capture(rt, image, scratch, inputs, mounts,
+        [shell, '-c', _SHELL_PROBE], timeout, environment, attempt / 'base-shell')
+    fields = (proc.stdout or '').split('\0')
+    if len(fields) != 4 or fields[-1] or not fields[0].startswith('/') or not fields[1]:
+        raise EnvironmentBuildError('Invalid Bash probe output', 'BASE_SHELL_CAPABILITY_MISSING')
+    observed = container_tools({'shell': fields[0]})
+    validate_targets(mounts, (observed['shell'],), concrete=True)
+    return dict(observed, shell_version=fields[1], path=fields[2])
+
+
+def preflight_tools(rt, image, scratch, inputs, mounts, requested, timeout, environment, attempt,
+                    require_pip=True):
+    """Python preparation preflight; callers explicitly decide whether pip is needed."""
     requested = base_tools(requested)
-    validate_targets(mounts, requested.values(), concrete=True)
-    tools = _capture(rt, image, scratch, inputs, mounts,
-        [requested['python'], '-c', _TOOL_PROBE, requested['shell']], timeout,
+    tools = preflight_shell(rt, image, scratch, inputs, mounts, requested, timeout, environment, attempt)
+    python = _capture(rt, image, scratch, inputs, mounts,
+        [requested['python'], '-c', _TOOL_PROBE], timeout,
         environment, attempt / 'base-tools', require_json=True)
-    if tuple(tools['python_version']) < (3, 8):
+    if tuple(python.get('python_version', ())) < (3, 8):
         raise EnvironmentBuildError('Common Base Python >=3.8 is required; no interpreter is injected',
                                     'BASE_PYTHON_CAPABILITY_MISSING')
+    tools.update(python=executable_value(python.get('python'), 'Observed Base Python'),
+                 python_version=python['python_version'])
     validate_targets(mounts, (tools['python'], tools['shell']), concrete=True)
-    # setup scripts and the benchmark wrapper are Bash by contract.
-    _capture(rt, image, scratch, inputs, mounts,
-        [tools['shell'], '-c', 'test -n "$BASH_VERSION" && set -euo pipefail && printf "%s\\n" "$BASH_VERSION"'],
-        timeout, environment, attempt / 'base-shell')
-    # This is the only package manager used by the extension. Probe it exactly
-    # once per attempt and carry the observed result forward instead of running
-    # a second probe under the same evidence name later in preparation.
-    pip_command = [tools['python'], '-m', 'pip']
-    pip_proc, pip_argv = _capture(rt, image, scratch, inputs, mounts,
-        pip_command + ['--version'], timeout, environment, attempt / 'base-pip-version')
-    (attempt / 'base-pip-version.log').write_text(pip_proc.stdout or '', encoding='utf-8')
-    package_manager = {
-        'source': 'common-base',
-        'command': pip_command,
-        'version_output': (pip_proc.stdout or '').strip(),
-        'probe_command': pip_argv,
-    }
+    package_manager = {}
+    if require_pip:
+        # The selected Base supplies the only package manager. Probe once and
+        # carry the observed command forward under one immutable evidence stem.
+        pip_command = [tools['python'], '-m', 'pip']
+        pip_proc, pip_argv = _capture(rt, image, scratch, inputs, mounts,
+            pip_command + ['--version'], timeout, environment, attempt / 'base-pip-version')
+        (attempt / 'base-pip-version.log').write_text(pip_proc.stdout or '', encoding='utf-8')
+        package_manager = {
+            'source': 'common-base', 'command': pip_command,
+            'version_output': (pip_proc.stdout or '').strip(), 'probe_command': pip_argv,
+        }
     return tools, package_manager
+
 
 
 def _pip_check(rt, image, scratch, inputs, mounts, pip_command, timeout, environment, log_path):
@@ -273,130 +292,151 @@ def _prefix_activation(info, before):
 
 
 def prepare_environment(rt, image, scratch, inputs, mounts, spec, attempt, timeout):
-    """Build the run-local delta strictly with tools from the Common Base.
+    """Prepare declared per-experiment additions with tools from the selected Base.
 
-    Boundary:
-      * mount requirement text and Git-managed setup scripts;
-      * run Base ``python -m pip install --prefix ... -r ...`` inside container;
-      * run setup scripts with Base Bash inside container;
-      * never invoke host Python/pip as the environment builder;
-      * never mount/inject pip, Python, a resolver or package-manager payload.
+    Bash is common to all execution. Python inspection and pip are requested
+    by requirements/protection/import declarations, not by an image's language.
+    Scripts share the private tools prefix, not their process environments.
     """
-    if spec.get('dependency_policy') != DEPENDENCY_POLICY:
-        raise EnvironmentBuildError('Unknown/missing dependency policy; generate a new experiment', 'UNKNOWN_DEPENDENCY_POLICY')
-    requested = base_tools(spec['base']['tools'])
-    prefix, tools_dir = scratch / 'python', scratch / 'tools'
-    prefix.mkdir()
-    tools_dir.mkdir()
-    # These only prevent user-site/bytecode leakage; no pip implementation or
-    # resolver policy is supplied by the extension.
-    env = {'PYTHONNOUSERSITE': '1', 'PYTHONDONTWRITEBYTECODE': '1'}
     result = {
-        'schema_version': 5,
-        'state': 'preparing',
-        'phase': 'tool-preflight',
-        'construction': DEPENDENCY_POLICY,
+        'schema_version': 6,
+        'state': 'preparing', 'phase': 'contract-validation',
+        'construction': spec.get('dependency_policy'),
         'requirements': spec.get('requirements', []),
         'setup_scripts': spec.get('setup_scripts', []),
         'protected_packages': spec.get('protected_packages', {}),
-        'started_at': time.time(),
-        'install_commands': [],
-        'setup_commands': [],
-        'boundary': 'container-native-tools/requirements-text+setup-scripts',
+        'started_at': time.time(), 'install_commands': [], 'setup_commands': [],
+        'boundary': 'container-native-tools/declared-preparation',
+        'resolved_additions': [], 'validation': {'status': 'not-requested'},
     }
     out = attempt / 'environment.json'
     try:
-        tools, package_manager = preflight_tools(
-            rt, image, scratch, inputs, mounts, requested, timeout, env, attempt)
+        needs = validate_preparation(spec)
+        result['required_tools'] = needs
+        requested = container_tools(spec['base']['tools'])
+        validate_environment(spec.get('environment', {}), needs['python'])
+        # Frozen old plans retain their pre-change preparation environment.
+        env = {} if spec['dependency_policy'] == DEPENDENCY_POLICY else dict(spec.get('environment', {}))
+        if needs['python']:
+            env.update(PYTHONNOUSERSITE='1', PYTHONDONTWRITEBYTECODE='1')
+        tools_dir = scratch / 'tools'
+        tools_dir.mkdir()
+        result['phase'] = 'tool-preflight'
+        if needs['python']:
+            tools, package_manager = preflight_tools(
+                rt, image, scratch, inputs, mounts, requested, timeout, env, attempt,
+                require_pip=needs['pip'])
+            if needs['pip']:
+                result['package_manager'] = package_manager
+        else:
+            tools = preflight_shell(rt, image, scratch, inputs, mounts, requested, timeout, env, attempt)
         result['tools'] = tools
-        result['package_manager'] = package_manager
-        python = tools['python']
-        pip = package_manager['command']
+        activation = {'BPCE_BASE_SHELL': tools['shell'], 'BPCE_PREFIX': TOOLS_PREFIX}
 
-        result['phase'] = 'base-inspection'
-        before = _inspect(rt, image, scratch, inputs, mounts, python,
-            spec.get('protected_packages', {}).values(), timeout, env, log_stem=attempt / 'base-inspection')
-        result['base'] = before
-        protected = spec.get('protected_packages', {})
-        for package in protected:
-            if canonical(package) not in before['packages']:
-                raise EnvironmentBuildError('Required Base package is absent: ' + package, 'PROTECTED_BASE_MISSING')
-        result['phase'] = 'base-dependency-baseline'
-        baseline = _pip_check(rt, image, scratch, inputs, mounts, pip, timeout, env, attempt / 'pip-check-before.log')
-        result['dependency_check_before'] = baseline
+        if needs['python']:
+            python = tools['python']
+            activation.update(BPCE_BASE_PYTHON=python,
+                              PYTHONNOUSERSITE='1', PYTHONDONTWRITEBYTECODE='1')
+            result['phase'] = 'base-inspection'
+            protected = spec.get('protected_packages', {})
+            before = _inspect(rt, image, scratch, inputs, mounts, python,
+                protected.values(), timeout, env, log_stem=attempt / 'base-inspection')
+            result['base'] = before
+            for package in protected:
+                if canonical(package) not in before['packages']:
+                    raise EnvironmentBuildError('Required Base package is absent: ' + package, 'PROTECTED_BASE_MISSING')
+            base_path = before['path']
+        else:
+            base_path = tools['path']
 
-        # Command/tool prerequisites are installed only by Git-managed scripts,
-        # executed with the Base Bash.  Their writable destination is /bpce/tools.
-        setup_env = dict(env, BPCE_PREFIX=TOOLS_PREFIX, BPCE_BASE_PYTHON=python,
-                         BPCE_BASE_SHELL=tools['shell'], PATH=TOOLS_PREFIX + '/bin:' + before['path'])
+        if needs['pip']:
+            prefix = scratch / 'python'
+            prefix.mkdir()
+            pip = package_manager['command']
+            result['phase'] = 'base-dependency-baseline'
+            baseline = _pip_check(rt, image, scratch, inputs, mounts, pip, timeout, env,
+                                  attempt / 'pip-check-before.log')
+            result['dependency_check_before'] = baseline
+
+        if spec.get('setup_scripts'):
+            activation['PATH'] = TOOLS_PREFIX + '/bin' + (':' + base_path if base_path else '')
+        setup_env = dict(env, **activation)
         result['phase'] = 'setup-scripts'
         for index, rel in enumerate(spec.get('setup_scripts', []), 1):
             if not rel.startswith('inputs/') or '..' in Path(rel).parts:
                 raise EnvironmentBuildError('Invalid setup script path: ' + rel, 'SETUP_SCRIPT_INVALID')
             command = [tools['shell'], INPUTS + '/' + rel[len('inputs/'):]]
             name = _safe_log_name(index, rel)
-            proc, argv = _container_run(rt, image, scratch, inputs, mounts, command, timeout,
-                                       environment=setup_env, pwd=INPUTS, log=attempt / name)
-            result['setup_commands'].append({'resource': rel, 'command': argv, 'log': name, 'exit_code': proc.returncode})
+            try:
+                proc, argv = _container_run(rt, image, scratch, inputs, mounts, command, timeout,
+                                           environment=setup_env, pwd=INPUTS, log=attempt / name)
+            except subprocess.TimeoutExpired as error:
+                result['setup_commands'].append({'resource': rel, 'command': error.cmd,
+                                                'log': name, 'timed_out': True})
+                raise EnvironmentBuildError('Setup script timed out: ' + rel,
+                                            'SETUP_SCRIPT_TIMEOUT') from error
+            result['setup_commands'].append({'resource': rel, 'command': argv, 'log': name,
+                                            'exit_code': proc.returncode})
             if proc.returncode:
-                raise EnvironmentBuildError('Setup script failed: ' + rel, 'SETUP_SCRIPT_FAILED', {'exit_code': proc.returncode})
+                raise EnvironmentBuildError('Setup script failed: ' + rel, 'SETUP_SCRIPT_FAILED',
+                                            {'exit_code': proc.returncode})
         result['tools_layer'] = tree_identity(tools_dir)
 
-        # Python dependency semantics come from the requirement files and the
-        # selected Common Base pip.  The extension supplies only the writable
-        # destination prefix required by an immutable SIF.
-        result['phase'] = 'dependency-installation'
-        if spec.get('requirements'):
-            command = pip + ['install', '--prefix', PYTHON_PREFIX]
-            for rel in spec['requirements']:
-                if not rel.startswith('inputs/') or '..' in Path(rel).parts:
-                    raise EnvironmentBuildError('Invalid staged requirements path: ' + rel)
-                command += ['--requirement', INPUTS + '/' + rel[len('inputs/'):]]
-            proc, argv = _container_run(rt, image, scratch, inputs, mounts, command, timeout,
-                                       environment=env, pwd=INPUTS, log=attempt / 'pip-install.log')
-            result['install_commands'].append(argv)
-            if proc.returncode:
-                raise EnvironmentBuildError('Common Base pip dependency installation failed; see pip-install.log',
-                                            'DEPENDENCY_INSTALL_FAILED', {'exit_code': proc.returncode})
-        else:
-            (attempt / 'pip-install.log').write_text('No additional Python requirements.\n')
+        if needs['pip']:
+            result['phase'] = 'dependency-installation'
+            if spec.get('requirements'):
+                command = pip + ['install', '--prefix', PYTHON_PREFIX]
+                for rel in spec['requirements']:
+                    if not rel.startswith('inputs/') or '..' in Path(rel).parts:
+                        raise EnvironmentBuildError('Invalid staged requirements path: ' + rel)
+                    command += ['--requirement', INPUTS + '/' + rel[len('inputs/'):]]
+                proc, argv = _container_run(rt, image, scratch, inputs, mounts, command, timeout,
+                                           environment=env, pwd=INPUTS, log=attempt / 'pip-install.log')
+                result['install_commands'].append(argv)
+                if proc.returncode:
+                    raise EnvironmentBuildError('Common Base pip dependency installation failed; see pip-install.log',
+                                                'DEPENDENCY_INSTALL_FAILED', {'exit_code': proc.returncode})
+            else:  # Only a frozen legacy plan requests pip without requirements.
+                (attempt / 'pip-install.log').write_text('No additional Python requirements.\n')
+            result['phase'] = 'dependency-layer-validation'
+            layer = _inspect(rt, image, scratch, inputs, mounts, python, [], timeout, env,
+                             layer=PYTHON_PREFIX, log_stem=attempt / 'prefix-inspection')
+            atomic_json(attempt / 'layer-inventory.json', layer)
+            result['resolved_additions'] = layer['distributions']
+            result['validation'] = validate_layer_inventory(
+                before['packages'], layer['distributions'], spec.get('requirement_pins', {}))
+            activation.update(_prefix_activation(layer, before))
+            active = dict(env, **activation)
+            result['phase'] = 'dependency-check'
+            after_check = _pip_check(rt, image, scratch, inputs, mounts, pip, timeout, active,
+                                     attempt / 'pip-check-after.log')
+            result['dependency_check_after'] = after_check
+            delta = dependency_check_delta(baseline, after_check)
+            result['dependency_check_delta'] = {
+                'new_issues': delta, 'baseline_exit_code': baseline['exit_code'],
+                'after_exit_code': after_check['exit_code'],
+            }
+            if delta:
+                raise EnvironmentBuildError('Additional requirements introduced dependency conflicts',
+                                            'DEPENDENCY_CHECK_FAILED', {'new_issues': delta})
+            result['prefix_identity'] = tree_identity(prefix)
 
-        result['phase'] = 'dependency-layer-validation'
-        layer = _inspect(rt, image, scratch, inputs, mounts, python, [], timeout, env,
-                         layer=PYTHON_PREFIX, log_stem=attempt / 'prefix-inspection')
-        atomic_json(attempt / 'layer-inventory.json', layer)
-        result['resolved_additions'] = layer['distributions']
-        result['validation'] = validate_layer_inventory(before['packages'], layer['distributions'], spec.get('requirement_pins', {}))
-        activation = _prefix_activation(layer, before)
-        activation.update(BPCE_BASE_PYTHON=python, BPCE_BASE_SHELL=tools['shell'])
-        active = dict(env, **activation)
         result['runtime_environment'] = activation
-
-        result['phase'] = 'dependency-check'
-        after_check = _pip_check(rt, image, scratch, inputs, mounts, pip, timeout, active, attempt / 'pip-check-after.log')
-        result['dependency_check_after'] = after_check
-        delta = dependency_check_delta(baseline, after_check)
-        result['dependency_check_delta'] = {
-            'new_issues': delta,
-            'baseline_exit_code': baseline['exit_code'],
-            'after_exit_code': after_check['exit_code'],
-        }
-        if delta:
-            raise EnvironmentBuildError('Additional requirements introduced dependency conflicts',
-                                        'DEPENDENCY_CHECK_FAILED', {'new_issues': delta})
-
-        result['phase'] = 'import-validation'
-        modules = list(dict.fromkeys(list(protected.values()) + spec.get('smoke_imports', [])))
-        after = _inspect(rt, image, scratch, inputs, mounts, python, modules, timeout, active,
-                         log_stem=attempt / 'active-inspection')
-        result['constructed'] = after
-        for package, module in protected.items():
-            if (after['packages'].get(canonical(package)) != before['packages'][canonical(package)]
-                    or after['imports'].get(module) != before['imports'].get(module)):
-                raise EnvironmentBuildError('Base package/import changed: ' + package, 'PROTECTED_BASE_SHADOW')
-
-        result['prefix_identity'] = tree_identity(prefix)
-        result.update(state='ready', phase='complete', protected_validation='passed')
+        if needs['python']:
+            result['phase'] = 'import-validation'
+            modules = list(dict.fromkeys(list(protected.values()) + spec.get('smoke_imports', [])))
+            after = _inspect(rt, image, scratch, inputs, mounts, python, modules, timeout,
+                             dict(env, **activation), log_stem=attempt / 'active-inspection')
+            result['constructed'] = after
+            for package, module in protected.items():
+                if (after['packages'].get(canonical(package)) != before['packages'][canonical(package)]
+                        or after['imports'].get(module) != before['imports'].get(module)):
+                    raise EnvironmentBuildError('Base package/import changed: ' + package, 'PROTECTED_BASE_SHADOW')
+            result['protected_validation'] = 'passed' if protected else 'not-requested'
+            result['import_validation'] = {'status': 'passed', 'modules': modules} if modules else {'status': 'not-requested'}
+        result.update(state='ready', phase='complete',
+                      software_preparation='completed' if any((spec.get('setup_scripts'), needs['python']))
+                      else 'not-requested')
         return result
     except BaseException as error:
         result.update(state='failed', error_type=type(error).__name__, error=str(error),

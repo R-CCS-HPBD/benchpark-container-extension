@@ -37,38 +37,12 @@ The extension is intentionally external to Benchpark Core. It provides container
 benchpark-container-extension/
 ├── core/
 │   └── files/                     # generic Benchpark plugin-seam payload
-│
-├── examples/
-│   ├── applications/              # generic Ramble application examples
-│   ├── experiments/               # generic Benchpark experiment examples
-│   ├── systems/                   # generic container-capable System examples
-│   ├── images/                    # example image/catalog metadata
-│   └── validation/                # generic validation inputs
-│
 ├── src/
-│   ├── benchpark_container/
-│   │   ├── backends/              # Apptainer/Singularity/Docker backends
-│   │   ├── cer/
-│   │   │   └── collectors/        # hardware/container CER collectors
-│   │   └── resources/
-│   │       └── runtime.pyz         # packaged node-side runtime worker
-│   ├── benchpark_integration/      # generic Benchpark integration API
-│   └── benchpark_tuning/           # generic tuning/integration support
-│
-├── tests/
-│   ├── legacy/                    # retained compatibility tests
-│   └── test_*.py                  # current public regression tests
-│
+│   ├── benchpark_container/       # container execution and CER
+│   ├── benchpark_integration/     # Benchpark integration API
+│   └── benchpark_tuning/          # tuning integration
 ├── tools/
-│   ├── patch_core.py              # generate Benchpark integration patch
-│   ├── configure_examples.py      # configure generic examples
-│   ├── verify_runtime.py          # Linux runtime acceptance helper
-│   ├── validate_reproducibility.py
-│   ├── verify_package.py
-│   ├── verify_upstream.py
-│   ├── build_runtime.py           # build/check runtime.pyz
-│   └── audit_architecture.py      # architecture-boundary checks
-│
+│   └── patch_core.py              # generate Benchpark integration patch
 ├── LICENSE
 ├── MANIFEST.in
 ├── NOTICE
@@ -76,11 +50,11 @@ benchpark-container-extension/
 └── README.md
 ```
 
-`core/` is **not** a copy of Benchpark. It contains the small generic integration seam consumed by `tools/patch_core.py`.
+`core/` is **not** a copy of Benchpark. It contains the small generic
+integration seam consumed by `tools/patch_core.py`.
 
-`src/benchpark_container/resources/runtime.pyz` is the portable node-side worker shipped with the extension. `tools/build_runtime.py --check` verifies that the packaged bundle matches its source.
-
-`tools/` contains support and validation utilities. The normal user-facing interface remains the `benchpark` CLI.
+`src/benchpark_container/resources/runtime.pyz` is the portable node-side
+worker shipped with the extension.
 
 ## Architecture
 
@@ -237,7 +211,7 @@ python -m pip install .
 For development:
 
 ```bash
-python -m pip install -e '.[test]'
+python -m pip install -e .
 ```
 
 Verify discovery:
@@ -252,6 +226,21 @@ benchpark cer --help
 
 ### Create a Catalog
 
+The default visible Catalog registration file is:
+
+```text
+~/benchpark-containers/catalogs.yaml
+```
+
+A different registration file can be selected with `BPCE_CONFIG`.
+Set it before creating or registering Catalogs:
+
+```bash
+export BPCE_CONFIG="$HOME/benchpark-containers/catalogs.yaml"
+```
+
+Create and register a Catalog:
+
 ```bash
 benchpark container catalog init \
   "$HOME/benchpark-containers/personal" \
@@ -260,39 +249,33 @@ benchpark container catalog init \
 benchpark container catalog add \
   "$HOME/benchpark-containers/personal" \
   --name personal
+
+benchpark container catalog list
 ```
 
-The default visible Catalog registration file is:
-
-```text
-~/benchpark-containers/catalogs.yaml
-```
-
-Override it with:
-
-```bash
-export BPCE_CONFIG="$HOME/benchpark-containers/catalogs.yaml"
-```
+The Catalog alias must be visible before registering container releases.
 
 ### Register a SIF release
 
 ```bash
+SIF=/absolute/path/to/common-base.sif
+SIF_SHA256=$(sha256sum "$SIF" | awk '{print $1}')
+
 benchpark container register \
   --catalog personal \
   --name common-base \
   --release r1 \
   --kind sif \
-  --source /absolute/path/to/common-base.sif \
-  --sha256 <SIF_SHA256> \
+  --source "$SIF" \
+  --sha256 "$SIF_SHA256" \
   --platform linux/arm64 \
   --accelerator nvidia \
   --runtime apptainer \
-  --runtime singularity \
   --python python3 \
   --shell bash
 ```
 
-Inspect it:
+Inspect and validate the retained artifact:
 
 ```bash
 benchpark container list
@@ -306,36 +289,46 @@ benchpark container validate \
   --release r1
 ```
 
+### Connect an external benchmark repository
+
+Benchmark-specific System, Experiment, and Ramble Application definitions
+can be supplied by a separate repository.
+
+```bash
+python -m benchpark_integration.repository_install \
+  --source-root /absolute/path/to/container-apps \
+  --name container-apps \
+  --display-name Container \
+  --feature container \
+  --benchpark-root /absolute/path/to/benchpark \
+  --install
+```
+
+When an already connected repository is updated, refresh its baseline with
+`--refresh-baseline`.
+
+Use module execution as shown above. Do not execute
+`repository_install.py` directly.
+
 ### Run a container-backed Experiment
 
-For an initialized container-capable System:
+Once a container-capable System and benchmark repository are available,
+use the normal Benchpark workflow:
 
 ```bash
 benchpark experiment init \
-  --dest=smoke-apptainer \
+  --dest=my-container-experiment \
   /path/to/initialized-system \
-  'common-base-smoke +container container_runtime=apptainer container_image=personal:common-base container_release=r1'
-```
+  '<benchmark> +container container_runtime=apptainer container_image=personal:common-base container_release=r1'
 
-Then use the normal Benchpark workflow:
-
-```bash
 benchpark setup \
-  /path/to/initialized-system/smoke-apptainer \
+  /path/to/initialized-system/my-container-experiment \
   /path/to/runs
 
 source /path/to/runs/setup.sh
 ```
 
-Run the generated Ramble workspace:
-
-```bash
-WS=/path/to/runs/system/smoke-apptainer/workspace
-
-ramble --workspace-dir "$WS" workspace setup
-ramble --workspace-dir "$WS" on
-ramble --workspace-dir "$WS" workspace analyze --formats json
-```
+Then run the generated Ramble workspace normally.
 
 There is no separate `benchpark container setup` workflow.
 
@@ -495,48 +488,6 @@ The extension does not by itself guarantee:
 - site scheduler/GPU configuration
 - continuous resource telemetry
 - automatic benchmark tuning
-
-## Development and validation
-
-Install development dependencies:
-
-```bash
-python -m pip install -e '.[test]'
-```
-
-Collect tests:
-
-```bash
-python -m pytest --collect-only -q
-```
-
-Run tests appropriate for the current host:
-
-```bash
-python -m pytest -q
-```
-
-Check the packaged runtime worker:
-
-```bash
-python tools/build_runtime.py --check
-```
-
-Run the architecture audit:
-
-```bash
-python tools/audit_architecture.py
-```
-
-Build a wheel:
-
-```bash
-python -m pip wheel . \
-  --no-deps \
-  -w /tmp/bpce-wheel
-```
-
-Some runtime/GPU acceptance tests require the corresponding Linux runtime, driver, image, and benchmark environment. Host-side tests on another OS are not a substitute for Linux runtime acceptance.
 
 ## License
 

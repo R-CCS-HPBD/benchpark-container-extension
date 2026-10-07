@@ -31,6 +31,8 @@ def pin_image(value):
     uri = value['uri']
     match = IMAGE.fullmatch(uri)
     result = {'uri': uri, 'platform': value.get('platform', 'unverified')}
+    if 'accelerator' in value:
+        result['accelerator'] = value['accelerator']
     if match:
         if uri.split('@', 1)[0].rsplit('/', 1)[-1].endswith(':latest'):
             raise ValidationError('latest is not permitted; use the digest reference without a latest tag')

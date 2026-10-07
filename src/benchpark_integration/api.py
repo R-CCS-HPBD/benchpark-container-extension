@@ -151,3 +151,5 @@ class ConfigurationContribution:
     # These repositories are workspace-local, never site-scope additions.
     modifier_repositories: Tuple[str, ...] = ()
     overwrite_policy: str = "fail"
+    # Optional snapshot-relative Ramble application repositories.
+    application_repositories: Tuple[str, ...] = ()

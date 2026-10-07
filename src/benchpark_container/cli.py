@@ -60,7 +60,12 @@ def verify_recorded_files(record_path, data):
         rel_path=Path(rel)
         if rel_path.is_absolute() or ".." in rel_path.parts:
             raise ValidationError("Unsafe CER file path: " + str(rel))
-        target=(root / rel_path).resolve()
+        lexical=root
+        for part in rel_path.parts:
+            lexical=lexical / part
+            if lexical.is_symlink():
+                raise ValidationError("CER recorded file symlink: " + str(rel))
+        target=lexical.resolve()
         if root not in target.parents and target != root:
             raise ValidationError("CER file escapes attempt directory: " + str(rel))
         if not target.is_file() or target.is_symlink():
@@ -69,6 +74,8 @@ def verify_recorded_files(record_path, data):
             raise ValidationError("CER recorded file size mismatch: " + str(rel))
         if sha256(target) != meta.get("sha256"):
             raise ValidationError("CER recorded file checksum mismatch: " + str(rel))
+        if "executable" in meta and bool(target.stat().st_mode & 0o111) != meta["executable"]:
+            raise ValidationError("CER recorded executable mode mismatch: " + str(rel))
         checked += 1
     return checked
 

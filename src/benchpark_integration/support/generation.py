@@ -47,7 +47,7 @@ def validate_contributions(values):
             actual = file_hash(r.source) if r.source else hashlib.sha256(r.text.encode()).hexdigest()
             if actual != r.sha256:
                 raise ExtensionError("Resource changed before publication: " + name)
-        for repo in c.modifier_repositories:
+        for repo in (*c.modifier_repositories, *c.application_repositories):
             relative_path(repo)
     return provider
 

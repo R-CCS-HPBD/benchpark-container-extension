@@ -1,8 +1,0 @@
-{
-  "schema_version": 1,
-  "source_root": "../experiments/common-base-smoke",
-  "image": {"uri": "registry.example/validation-only@sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"},
-  "requirements": ["requirements/extra.txt"],
-  "artifacts": [],
-  "variants": {}
-}

@@ -70,6 +70,11 @@ def finish_run(directory, record):
             key = str(p.relative_to(directory))
             meta = {"sha256": sha256(p), "bytes": p.stat().st_size}
             merge_file_metadata(files, {key: meta})
+    for p in sorted((directory / "source-evidence").rglob("*")):
+        if p.is_file() and not p.is_symlink():
+            merge_file_metadata(files, {p.relative_to(directory).as_posix():
+                {"sha256": sha256(p), "bytes": p.stat().st_size,
+                 "executable": bool(p.stat().st_mode & 0o111)}})
     record["files"] = files
     record["record_sha256"] = identity(record)
     atomic_json(directory / "cer.json", record)

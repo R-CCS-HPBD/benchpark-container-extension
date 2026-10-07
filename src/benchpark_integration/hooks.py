@@ -17,6 +17,9 @@ class Provider:
     api_version = 1
 
     def handle(self, event, context):
+        if event == 'repository_select':
+            from .repository_provider import select_repository
+            return select_repository(context)
         if event == 'request':
             return prepare_request(context)
         if event == 'system_saved':

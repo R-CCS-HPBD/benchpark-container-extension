@@ -1,19 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Resolve saved System declarations and benchmark requirements into plain data."""
-import hashlib
-import json
 from pathlib import Path
 import re
-import shlex
 
 from benchpark_integration.api import (ConfigurationContribution, ResourceSpec, SoftwareProvider, plain)
+from benchpark_integration.source_repository import capture_for_experiment
 from . import __version__
 from .requirements import scan_requirements
 from .image_selection import select_image, select_runtime
-from .contracts import base_tools, runtime_settings, validate_targets, DEPENDENCY_POLICY
+from .contracts import (base_tools, validate_targets, PREPARATION_POLICY,
+                        preparation_needs, validate_environment)
 from .artifacts import pin_external_artifacts
 from .provenance import source_provenance
-from .reproducibility import pin_image, validate_inputs, IMAGE
+from .reproducibility import validate_inputs
 from .util import ValidationError, check_no_secrets, inside, safe_name, sha256, strict
 
 
@@ -31,6 +30,52 @@ def requirements_resources(root, requested):
             for rel, h in scanned["files"].items()]
 
 
+ACCELERATOR_BACKENDS = {"cuda": "nvidia", "rocm": "amd"}
+
+
+def select_accelerator_backend(variants, explicit, runtime):
+    """Resolve an explicitly selected Benchpark GPU model into a container accelerator.
+
+    Generic CPU-only container experiments have neither variant and are left
+    untouched.  GPU-capable experiments must explicitly select exactly one of
+    +cuda/+rocm; a native default is never used as an implicit container backend.
+    """
+    explicit = plain(explicit)
+    supported = [name for name in ACCELERATOR_BACKENDS if name in variants]
+    requested = [name for name in ACCELERATOR_BACKENDS if name in explicit]
+    if not supported and not requested:
+        return None
+
+    def flag(value):
+        # Do not accept 1 as True or strings as bools at the native spec boundary.
+        if not isinstance(value, (list, tuple)) or len(value) != 1 or type(value[0]) is not bool:
+            raise ValidationError("Accelerator variant must contain one boolean")
+        return value[0]
+
+    concrete_enabled = [name for name in supported if flag(variants[name])]
+    selected = [name for name in requested if flag(explicit[name])]
+    if any(name not in supported for name in requested):
+        raise ValidationError("Explicit accelerator backend is absent from native variants")
+    if len(selected) != 1:
+        raise ValidationError(
+            "Container GPU experiment requires an explicit accelerator backend: select exactly one of +cuda or +rocm"
+        )
+    backend = selected[0]
+    if concrete_enabled != [backend]:
+        raise ValidationError(
+            "Explicit accelerator backend was not preserved by Benchpark concretization: "
+            "exactly one concrete backend must match +" + backend
+        )
+    accelerator = ACCELERATOR_BACKENDS[backend]
+    if runtime.get("gpu", "none") != accelerator:
+        raise ValidationError(
+            "Experiment +%s requires System gpu=%s; initialized System declares gpu=%s"
+            % (backend, accelerator, runtime.get("gpu", "none"))
+        )
+    return {"backend": backend, "accelerator": accelerator,
+            "selection_origin": "experiment-explicit", "system_gpu": runtime["gpu"]}
+
+
 def resolve(context):
     s, q, variants = plain(context.system), plain(context.requirements), plain(context.variants)
     check_no_secrets(s); check_no_secrets(q)
@@ -42,6 +87,7 @@ def resolve(context):
     if q["schema_version"] != 2:
         raise ValidationError("Experiment schema_version=2 is required; migrate experiment.py and re-initialize")
     runtime, runtime_selection = select_runtime(s, variants)
+    accelerator_selection = select_accelerator_backend(variants, context.explicit, runtime)
     requested_pm = plain(context.explicit).get("package_manager")
     if requested_pm and requested_pm != ["user-managed"]:
         raise ValidationError("Explicit package_manager conflicts with this user-managed application provider")
@@ -53,10 +99,22 @@ def resolve(context):
         raise ValidationError("Selected Tune was not prepared; declare extension_request_settings['tune']['allowed'] (v0.3), not legacy tuning_policy")
     root = Path(context.source_root).resolve()
     image, image_selection = select_image(s, q, variants, runtime)
+    needs = preparation_needs(q)
+    if needs["python"]:
+        base_tools(image["tools"])
+    if accelerator_selection is not None:
+        selected_accelerator = image_selection.get("accelerator")
+        if selected_accelerator != accelerator_selection["accelerator"]:
+            raise ValidationError(
+                "Selected image accelerator=%s does not match experiment backend +%s (%s)"
+                % (selected_accelerator or "undeclared", accelerator_selection["backend"],
+                   accelerator_selection["accelerator"])
+            )
     req = q.get("requirements", [])
     if not isinstance(req, list) or not all(isinstance(x, str) for x in req):
         raise ValidationError("requirements must be a list of source-relative files")
-    resources = []
+    source_snapshot = capture_for_experiment(root, context.name)
+    resources = list(source_snapshot.resources) if source_snapshot else []
     artifacts, targets, names = [], set(), set()
     roots = s.get("artifact_roots", {})
     for name, path in roots.items():
@@ -145,16 +203,17 @@ def resolve(context):
             raise ValidationError("Resource collision: " + res.target)
         unique[res.target] = res
     env = q.get("environment", {})
-    if not isinstance(env, dict):
-        raise ValidationError("environment must be a mapping")
-    for k, v in env.items():
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k) or not isinstance(v, (str, int, float)):
-            raise ValidationError("Invalid environment declaration")
-        if k.startswith(("BPCE_", "PIP_", "APPTAINER", "SINGULARITY")) or k in ("PATH", "PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV", "PYTHONNOUSERSITE", "PYTHONDONTWRITEBYTECODE"):
-            raise ValidationError("Python environment ownership conflict: " + k)
+    validate_environment(env, needs["python"])
+    # Report only checks that this declared preparation actually requests.
+    validation["pending"] = ["mounted-artifact-verification"]
+    if needs["pip"]:
+        validation["pending"] += ["dependency-resolution-in-selected-base", "base-version-conflict-check"]
+    if needs["python"]:
+        validation["pending"].append("requested-python-validation")
     plan = {"schema_version": 1, "extension_version": __version__, "benchmark": context.name,
         "base": image, "runtime": runtime, "runtime_selection": runtime_selection,
-        "image_selection": image_selection, "dependency_policy": DEPENDENCY_POLICY, "requirements": ["inputs/" + r for r in req],
+        "accelerator_selection": accelerator_selection,
+        "image_selection": image_selection, "dependency_policy": PREPARATION_POLICY, "requirements": ["inputs/" + r for r in req],
         "setup_scripts": staged_setup_scripts,
         "source_provenance": source_provenance(root, setup_scripts),
         "requirement_pins": requirement_pins, "validation": validation,
@@ -165,9 +224,13 @@ def resolve(context):
         "explicit": plain(context.explicit), "provenance": plain(context.provenance),
         "export_variables": q.get("variables", []), "executables": executables,
         "timeout_seconds": q.get("timeout_seconds", 3600)}
+    if source_snapshot:
+        plan["benchmark_source"] = source_snapshot.manifest
+        plan["benchmark_content_sha256"] = source_snapshot.manifest["content_sha256"]
     check_no_secrets(plan)
     return ConfigurationContribution(owner="container", payload=plan,
-        variables={"bpce_python": '"$BPCE_BASE_PYTHON"'},
+        variables={"bpce_python": '"$BPCE_BASE_PYTHON"'} if needs["python"] else {},
         modifiers=({"name": "bpce-execution", "mode": "standard"},),
         software_provider=SoftwareProvider(section={"packages": {}, "environments": {}}),
-        resources=tuple(unique.values()), modifier_repositories=("modifiers",))
+        resources=tuple(unique.values()), modifier_repositories=("modifiers",),
+        application_repositories=source_snapshot.application_repositories if source_snapshot else ())

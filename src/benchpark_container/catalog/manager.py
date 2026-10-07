@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import uuid
 
-from ..contracts import base_tools
+from ..contracts import container_tools
 from ..util import ValidationError, atomic_json, safe_name, strict, sha256, identity, check_no_secrets
 from ..image_store import verify_managed, regular_path, read_json, digest_value
 from .config import load_yaml, read_config, locked, sync_dir, ensure_directories
@@ -37,7 +37,7 @@ def validate_manifest(data):
             raise ValidationError('Use a supported canonical platform: linux/amd64 or linux/arm64')
         if item['accelerator'] not in ('none', 'nvidia', 'amd'):
             raise ValidationError('Unknown image accelerator family')
-        base_tools(item['tools'])
+        container_tools(item['tools'])
         if ('uri' in item) == ('oci_layout' in item):
             raise ValidationError('Declare exactly one uri or oci_layout source')
         if item['kind'] == 'sif' and ('oci_layout' in item or 'digest' in item):

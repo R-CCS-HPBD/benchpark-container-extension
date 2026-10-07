@@ -37,7 +37,8 @@ def setup_parser(parser):
     p.add_argument('--accelerator', choices=('none','nvidia','amd'))
     p.add_argument('--sha256'); p.add_argument('--digest')
     p.add_argument('--runtime', action='append', default=[])
-    p.add_argument('--python', dest='base_python', default='python3')
+    p.add_argument('--python', dest='base_python', default=None,
+                   help='Declare Base Python for requested Python preparation; omitted otherwise')
     p.add_argument('--shell', dest='base_shell', default='bash')
     p.add_argument('--skopeo', help='Explicit host OCI copier executable')
     p.add_argument('--timeout', type=int, default=3600)
@@ -64,8 +65,11 @@ def declaration(args):
         return data
     if not all((args.name, args.release, args.kind, args.platform, args.accelerator)):
         raise ValidationError('Inline registration requires --name --release --kind --platform --accelerator')
+    tools = {'shell': args.base_shell}
+    if args.base_python:
+        tools['python'] = args.base_python
     item = {'kind': args.kind, 'platform': args.platform, 'accelerator': args.accelerator,
-            'runtimes': args.runtime, 'tools': {'python': args.base_python, 'shell': args.base_shell}}
+            'runtimes': args.runtime, 'tools': tools}
     if args.source:
         source = args.source
         if args.kind == 'sif' and not source.startswith('file://'):

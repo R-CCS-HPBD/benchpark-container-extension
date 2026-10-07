@@ -5,6 +5,7 @@ from pathlib import Path
 import re
 import shlex
 from .runtime import concrete_plan
+from .contracts import preparation_needs
 from .util import ValidationError, atomic_json_verified, identity, sha256
 
 
@@ -50,17 +51,25 @@ def wrap_executable(modifier, name, executable, app_inst=None):
     extra = dict(executable.variables)
     if any(key in extra for key in reserved):
         raise ValidationError("Application executable overrides a reserved execution tool variable")
+    if not preparation_needs(plan)["python"] and any(
+            "{bpce_python}" in text for text in executable.template):
+        raise ValidationError("bpce_python requires declared Python preparation/validation; "
+                              "otherwise use an explicit benchmark command")
     extra.update(reserved)
     command = [expander.expand_var(x, extra_vars=extra) for x in executable.template]
     run_dir = Path(expander.expand_var_name("experiment_run_dir")).resolve()
     experiment = expander.expand_var_name("experiment_name")
     repeat = expander.expand_var_name("repeat_index")
-    if repeat == "{repeat_index}":
+    repeat_resolved = repeat != "{repeat_index}"
+    if not repeat_resolved:
         repeat = "unknown"
     concrete = concrete_plan(plan, values, command, experiment, repeat)
-    # This concrete-spec file is immutable; a new attempt is created at launch.
-    # Keep concrete plans outside allocation-cleaned experiment directories.
-    spec_dir = resources.parent / "concrete"
+    # Ramble can invoke executable modifiers once while rendering setup with
+    # repeat_index still unresolved, then again for the executable repeat.
+    # Only repeat-resolved specs are execution-accountable concrete plans.
+    # Keep the setup-time render artifact separate so accounting never expects
+    # a CER for a command Ramble will not execute. Both remain immutable.
+    spec_dir = resources.parent / ("concrete" if repeat_resolved else "provisional")
     spec_dir.mkdir(parents=True, exist_ok=True)
     spec_path = spec_dir / (identity(concrete) + ".json")
     # Content-addressed concrete plans may be published concurrently by setup
