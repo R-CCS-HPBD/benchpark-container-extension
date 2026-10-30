@@ -559,3 +559,7 @@ See `LICENSE` and `NOTICE`.
 # Acknowledgments
 
 This work is based on results obtained from the project, “Research and Development Project of the Enhanced Infrastructures for Post-5G Information and Communication Systems” (JPNP25013), commissioned by the New Energy and Industrial Technology Development Organization (NEDO).
+
+---
+
+*First made public on October 8, 2026.*
