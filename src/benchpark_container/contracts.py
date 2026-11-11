@@ -67,12 +67,18 @@ def preparation_needs(spec):
     return {'python': python, 'pip': pip}
 
 
+def execution_tools(spec):
+    """Tools of the selected execution image, after an optional setup build."""
+    build = spec.get("image_build")
+    return container_tools(build["tools"] if build is not None else spec["base"]["tools"])
+
+
 def validate_preparation(spec):
     """Validate a frozen preparation contract at every execution boundary."""
     if spec.get('dependency_policy') not in (PREPARATION_POLICY, DEPENDENCY_POLICY):
         raise ValidationError('Unknown/missing dependency policy; generate a new experiment')
     needs = preparation_needs(spec)
-    tools = container_tools(spec['base']['tools'])
+    tools = execution_tools(spec)
     if needs['python']:
         base_tools(tools)
     return needs
@@ -97,10 +103,10 @@ def validate_environment(environment, python_required):
 
 
 def runtime_settings(value):
-    strict(value, ('runtime', 'executable', 'worker_python', 'image_cache', 'gpu', 'backend_options'),
+    strict(value, ('runtime', 'executable', 'worker_python', 'image_cache', 'gpu', 'backend_options', 'providers', 'image_policy'),
            'System execution', ('runtime', 'executable', 'worker_python', 'image_cache'))
     from .backends.registry import backend_class
-    backend = backend_class(value['runtime'])
+    backend = backend_class(value['runtime'], value.get('providers', []))
     if not isinstance(value.get('backend_options', {}), dict):
         raise ValidationError('backend_options must be a System mapping')
     for key in ('executable', 'worker_python'):
@@ -110,6 +116,8 @@ def runtime_settings(value):
     if value.get('gpu', 'none') not in ('none', 'nvidia', 'amd'):
         raise ValidationError('Unknown GPU passthrough policy')
     result = dict(value, gpu=value.get('gpu', 'none'))
+    from .acquisition import validate_policy
+    validate_policy(result.get('image_policy', 'cache'), backend)
     backend.validate_config(result)
     if result['gpu'] not in backend.capabilities.accelerators:
         raise ValidationError('Selected runtime does not support the requested GPU policy')
@@ -184,3 +192,29 @@ def validate_accelerator_contract(plan):
         raise ValidationError('System/runtime accelerator differs from the resolved selection')
     if image.get('accelerator') != vendor:
         raise ValidationError('Image accelerator differs from the resolved selection')
+
+
+# Schema-3 lifecycle validation stays pure: no builder/backend initialization.
+SETUP_LIFECYCLE = "ramble-setup-v1"
+
+
+def validate_setup_contract(spec):
+    if "image_publish" in spec:
+        from .catalog_publication import validate_publication
+        validate_publication(spec["image_publish"])
+    if "image_build" in spec:
+        from .image_build import validate_frozen_build
+        validate_frozen_build(spec["image_build"], spec.get("resources", {}), spec["runtime"])
+    if spec.get("preparation_lifecycle") != SETUP_LIFECYCLE:
+        raise ValidationError("Execution schema 3 requires ramble-setup-v1")
+    options = spec.get("setup")
+    strict(options, ("offline", "timeout_seconds"), "setup", ("offline", "timeout_seconds"))
+    if type(options["offline"]) is not bool:
+        raise ValidationError("setup.offline must be boolean")
+    timeout = options["timeout_seconds"]
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= 7 * 86400:
+        raise ValidationError("Invalid setup timeout_seconds")
+    if spec.get("runtime", {}).get("image_policy", "cache") != "cache":
+        raise ValidationError("Setup lifecycle requires retained image_policy=cache; no run-time pull")
+    if spec.get("base", {}).get("platform") not in ("linux/amd64", "linux/arm64"):
+        raise ValidationError("Setup requires an explicit target platform")

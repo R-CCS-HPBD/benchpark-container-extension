@@ -12,7 +12,17 @@ class BpceExecution(BasicModifier):
     default_mode("standard")
     executable_modifier("wrap_benchmark")
 
+    register_phase("bpce_prepare", pipeline="setup", run_after=["make_experiments"])
+
+    def _bpce_prepare(self, workspace, app_inst=None):
+        if workspace.dry_run:
+            return
+        return self._staged_call("prepare_experiment", workspace, app_inst)
+
     def wrap_benchmark(self, executable_name, executable, app_inst=None):
+        return self._staged_call("wrap_executable", executable_name, executable, app_inst)
+
+    def _staged_call(self, method, *args):
         resources = Path(self._file_path).resolve().parents[2]
         bundle = resources / "runtime.pyz"
         if not bundle.is_file():
@@ -27,6 +37,6 @@ class BpceExecution(BasicModifier):
         sys.path.insert(0, str(bundle))
         try:
             module = importlib.import_module("bpce_node.ramble_adapter")
-            return module.wrap_executable(self, executable_name, executable, app_inst)
+            return getattr(module, method)(self, *args)
         finally:
             sys.path.remove(str(bundle))

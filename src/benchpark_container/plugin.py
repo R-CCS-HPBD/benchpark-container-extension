@@ -6,9 +6,12 @@ def describe():
         name="container", api_version=2,
         options=(
             OptionSpec("container_runtime", "default", "Runtime from the initialized System capabilities"),
-            OptionSpec("container_image", "default", "Catalog image name override (requires container_release)"),
+            OptionSpec("container_image", "default", "Catalog name (with release) or pinned OCI URI (no catalog registration required)"),
             OptionSpec("container_release", "default", "Fixed release of the selected image"),
-        ), resolver=resolve, required_variants={"package_manager": "user-managed"},
+        ), resolver=resolve, required_variants={
+            "package_manager": "user-managed",
+            "githash": "none",
+        },
     )
 
 

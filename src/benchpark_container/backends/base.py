@@ -87,6 +87,8 @@ class RuntimeCapabilities:
     readonly_mounts: bool = True
     working_directory: bool = True
     immutable_image: bool = True
+    readonly_overlay_formats: frozenset = frozenset()
+    image_build_formats: frozenset = frozenset()
 
 
 def oci_reference(base):
@@ -150,10 +152,24 @@ class RuntimeBackend:
     def resolve_image(self, base, timeout):
         raise NotImplementedError
 
+    def resolve_local_image(self, base, timeout):
+        raise ValidationError("This backend has not declared offline image acquisition")
+
+    def load_prepared_image(self, base, prepared, timeout):
+        raise ValidationError("This backend has not declared prepared-image execution")
+
+    def image_build_command(self, output, definition, *, fakeroot):
+        raise ValidationError("Selected backend does not support image construction")
+
+    def check_built_image(self, path, platform, log, timeout):
+        raise ValidationError("Selected backend does not support built-image validation")
+
     def observe_image(self, image):
         return {"kind": image.kind, "identity": image.identity, **dict(image.details)}
 
     def validate_request(self, request):
+        if isinstance(request.image, ImageRef) and request.image.details.get("overlay") and request.image.details["overlay"].get("format") not in self.capabilities.readonly_overlay_formats:
+            raise ValidationError("Backend does not support the requested read-only Overlay")
         if request.accelerator not in self.capabilities.accelerators:
             raise ValidationError("Backend does not support the requested accelerator")
         if not self.capabilities.immutable_image:
@@ -164,6 +180,16 @@ class RuntimeBackend:
             raise ValidationError("Backend does not support the requested working directory")
         if len({m.target for m in request.mounts}) != len(request.mounts):
             raise ValidationError("Duplicate mount targets are not allowed")
+
+    def execution_binding(self, request):
+        self.applied_binding = {
+            "schema_version": 1, "runtime": self.name,
+            "accelerator": request.accelerator,
+            "device_visibility": {k: request.environment[k] for k in GPU_ENV if k in request.environment},
+            "mount_count": len(request.mounts),
+            "basis": "backend-encoded-request", "device_use_verified": False,
+        }
+        return dict(self.applied_binding)
 
     def build_command(self, request):
         raise NotImplementedError
@@ -186,6 +212,20 @@ class RuntimeBackend:
         if Path(inputs).is_dir():
             all_mounts.append(Mount(str(Path(inputs).resolve()), "/bpce/inputs", True))
         all_mounts.extend(Mount(m["resolved_source"], m["target"], m["readonly"]) for m in mounts)
+        site_mounts = self.settings.get('backend_options', {}).get('site_mounts', [])
+        if site_mounts:
+            from ..contracts import validate_targets
+            validate_targets(list(mounts) + site_mounts, concrete=True)
+        for entry in site_mounts:
+            source = Path(entry['source'])
+            if not source.exists(): raise ValidationError('Required site mount is missing: '+str(source))
+            all_mounts.append(Mount(str(source.resolve()), entry['target'], entry['readonly']))
+        prefixes = getattr(self, "prepared_prefixes", ())
+        for mount in prefixes:
+            if (not isinstance(mount, Mount) or not mount.readonly
+                    or mount.target not in ("/bpce/tools", "/bpce/python")):
+                raise ValidationError("Invalid prepared internal prefix mount")
+        all_mounts.extend(prefixes)
         env = {k: str(v) for k, v in (environment or {}).items()}
         env.setdefault("XDG_CACHE_HOME", "/bpce/cache")
         env.setdefault("TMPDIR", "/bpce/tmp")
@@ -210,3 +250,18 @@ def command_scope(runtime, command):
     else:
         with scope(command):
             yield
+
+
+@dataclass(frozen=True)
+class PreparedCommand:
+    """An argv valid only inside its context; cleanup belongs to that context."""
+    argv: tuple
+    host_environment: Mapping
+
+
+@contextmanager
+def prepared_command(runtime, command):
+    """Adapt legacy backends without exposing in-place argv mutation to callers."""
+    private = list(command)
+    with command_scope(runtime, private):
+        yield PreparedCommand(tuple(private), MappingProxyType(dict(runtime.host_env())))

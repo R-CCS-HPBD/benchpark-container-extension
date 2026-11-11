@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "benchpark-container-extension"
-version = "1.0.0.dev9"
+version = "1.0.0.dev12+par2.overlay2.thinhooks1.setup1.imagebuild1"
 description = "External Common Base Container execution and per-run CER for Benchpark"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
-dependencies = ["PyYAML==6.0.3", "packaging==25.0"]
+dependencies = ["PyYAML==6.0.3", "packaging>=25.0,<27.0"]
 
 [project.optional-dependencies]
 test = ["pytest==9.0.2", "setuptools==82.0.1"]
@@ -46,3 +46,7 @@ tune = "benchpark_integration.hooks:provider"
 [project.entry-points."benchpark.cli.v1"]
 cer = "benchpark_integration.hooks:cer_command"
 container = "benchpark_container.container_cli:cli_command"
+
+# Explicit, opt-in Container/Profiler API v2 capability declaration.
+[project.entry-points."benchpark.container.interop.v2"]
+container = "benchpark_container.profiler_frontend:interop_descriptor"

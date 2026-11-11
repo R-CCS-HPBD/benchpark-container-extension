@@ -90,6 +90,25 @@ class OCIRuntimeBackend(RuntimeBackend):
             raise ValidationError('Inspected image RepoDigests do not contain the requested pinned repository digest')
         return self._validated_image(info, base, reference)
 
+    def resolve_local_image(self, base, timeout):
+        reference = oci_reference(base)
+        info = self._object(self.cli() + ['image', 'inspect', reference], timeout, allow_absent=True)
+        if info is None:
+            raise ValidationError('OFFLINE_IMAGE_MISSING: ' + reference)
+        digests = info.get('RepoDigests') or []
+        if canonical_reference(reference) not in {canonical_reference(d) for d in digests}:
+            raise ValidationError('Local image digest mismatch')
+        return self._validated_image(info, base, reference)
+
+    def load_prepared_image(self, base, prepared, timeout):
+        if prepared.get('kind') != 'oci' or not HASH_ID.fullmatch(prepared.get('reference', '')):
+            raise ValidationError('Prepared OCI image requires a verified image ID')
+        info = self._object(self.cli() + ['image', 'inspect', prepared['reference']], timeout)
+        image = self._validated_image(info, base, prepared['identity'])
+        if image.reference != prepared['reference'] or dict(image.details) != prepared['details']:
+            raise ValidationError('Prepared OCI image changed; rerun setup in a new workspace')
+        return image
+
     def _validated_image(self, info, base, reference):
         digests = info.get('RepoDigests') or []
         image_id = info.get('Id', '')
@@ -123,6 +142,7 @@ class OCIRuntimeBackend(RuntimeBackend):
 
     def build_command(self, request):
         self.validate_request(request)
+        self.execution_binding(request)
         if self.closed:
             raise ValidationError("Cannot reuse a closed runtime backend")
         if not isinstance(request.image, ImageRef) or request.image.kind != 'oci':

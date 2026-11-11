@@ -42,7 +42,7 @@ _TEMPLATE_VARIABLE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
 def expand_variant_template(template, variants, field="value"):
-    """Expand a scalar {variant} template to exactly one concrete value."""
+    """Expand a scalar ``{variant}`` template to one concrete value."""
     if not isinstance(template, str) or not template:
         raise ValidationError(
             "%s must be a non-empty string" % field
@@ -88,37 +88,11 @@ _ENTRY_KEYS = {
 
 
 def _expand_artifact_id(template, variants):
-    if not isinstance(template, str) or not template:
-        raise ValidationError("artifact must be a non-empty logical artifact ID")
-
-    def replace(match):
-        name = match.group(1)
-        values = variants.get(name)
-
-        if (
-            not isinstance(values, (list, tuple))
-            or len(values) != 1
-        ):
-            raise ValidationError(
-                "Artifact ID template variable must resolve to exactly one "
-                "Experiment variant: " + name
-            )
-
-        value = values[0]
-
-        if not isinstance(value, (str, int)):
-            raise ValidationError(
-                "Artifact ID template variable must be scalar: " + name
-            )
-
-        return str(value)
-
-    logical_id = _TEMPLATE_VARIABLE.sub(replace, template)
-
-    if "{" in logical_id or "}" in logical_id:
-        raise ValidationError(
-            "Unresolved artifact ID template: " + logical_id
-        )
+    logical_id = expand_variant_template(
+        template,
+        variants,
+        field="Artifact ID",
+    )
 
     if not _ARTIFACT_ID.fullmatch(logical_id):
         raise ValidationError(
@@ -126,7 +100,6 @@ def _expand_artifact_id(template, variants):
         )
 
     return logical_id
-
 
 def load_artifact_mapping():
     """Load the user/site artifact mapping.
@@ -263,6 +236,7 @@ def resolve_artifact_reference(
     variants,
     mapping,
     expected_kind,
+    *, allow_missing=False,
 ):
     """Resolve one logical artifact requirement to a physical host path."""
 
@@ -292,7 +266,7 @@ def resolve_artifact_reference(
 
     path = Path(declaration["path"]).resolve()
 
-    if not path.exists():
+    if not allow_missing and not path.exists():
         raise ValidationError(
             "Mapped artifact does not exist: "
             + logical_id

@@ -38,44 +38,68 @@ def start_run(root, spec):
 
 
 def finish_run(directory, record):
+    import copy
+    from .evidence import validate_files
     directory = Path(directory)
     if (directory / "cer.json").exists():
         raise FileExistsError(str(directory / "cer.json"))
     record["finished_at"] = now()
-
-    # Additive post-run reproducibility evidence. Collection is intentionally
-    # outside condition/plan identity and is non-fatal to benchmark status.
-    collected = collect_v1(directory, record)
-    try:
-        merge_additive(record.setdefault("observed", {}), collected["observed"])
-    except ValueError as exc:
-        collected["collection"]["status"] = "partial"
-        collected["collection"].setdefault("finalization_errors", []).append(str(exc))
-    record["collection"] = collected["collection"]
-
-    files = {}
-    try:
-        merge_file_metadata(files, collected["files"])
-    except ValueError as exc:
-        record["collection"]["status"] = "partial"
-        record["collection"].setdefault("finalization_errors", []).append(str(exc))
-    for p in sorted(directory.iterdir()):
-        if p.is_file() and p.name not in ("cer.json", "started.json"):
-            meta = {"sha256": sha256(p), "bytes": p.stat().st_size}
-            merge_file_metadata(files, {p.name: meta})
-    # Result artifacts live on private mounts outside the mutable Python env.
-    # Do not hash the whole venv, model cache, or unbounded external trees.
-    for p in sorted((directory / "outputs").rglob("*")):
-        if p.is_file() and not p.is_symlink():
-            key = str(p.relative_to(directory))
-            meta = {"sha256": sha256(p), "bytes": p.stat().st_size}
-            merge_file_metadata(files, {key: meta})
-    for p in sorted((directory / "source-evidence").rglob("*")):
-        if p.is_file() and not p.is_symlink():
-            merge_file_metadata(files, {p.relative_to(directory).as_posix():
-                {"sha256": sha256(p), "bytes": p.stat().st_size,
-                 "executable": bool(p.stat().st_mode & 0o111)}})
+    files = copy.deepcopy(record.get("files", {}))
+    # A registered artifact changing is integrity failure, not an optional
+    # collector failure. Keep started.json and raise instead of resealing it.
+    _validate_before_seal(directory, record, files)
+    paths = [p for p in directory.iterdir() if p.is_file() and p.name not in ("cer.json", "started.json", "evidence-integrity-failure.json")]
+    for folder in ("outputs", "source-evidence"):
+        paths += [p for p in (directory / folder).rglob("*") if p.is_file()]
+    for path in sorted(paths):
+        name = path.relative_to(directory).as_posix()
+        meta = {"sha256": sha256(path), "bytes": path.stat().st_size}
+        if name.startswith("source-evidence/"):
+            meta["executable"] = bool(path.stat().st_mode & 0o111)
+        validate_files(directory, {name: meta})
+        if name in files:
+            # Preserve extra attribution metadata, but never a stale digest.
+            if any(files[name].get(k) != v for k, v in meta.items()):
+                raise ValueError("CER evidence content collision: " + name)
+        else:
+            files[name] = meta
     record["files"] = files
+    try:
+        collected = collect_v1(directory, record)
+        observed = copy.deepcopy(record.get("observed", {}))
+        new_files = copy.deepcopy(files)
+        validate_files(directory, collected["files"])
+        merge_additive(observed, collected["observed"])
+        merge_file_metadata(new_files, collected["files"])
+        record["observed"], record["files"] = observed, new_files
+        record["collection"] = collected["collection"]
+    except Exception as exc:
+        record["collection"] = {"schema_version": 1, "status": "partial", "non_fatal": True,
+            "capture_phase": "post-execution-finalization", "collectors": [],
+            "finalization_errors": [type(exc).__name__ + ": " + str(exc)]}
+    _validate_before_seal(directory, record, record["files"])
     record["record_sha256"] = identity(record)
     atomic_json(directory / "cer.json", record)
-    # started.json is intentionally retained. No final record is ever overwritten.
+
+
+def _validate_before_seal(directory, record, files):
+    """Never seal stale evidence. Preserve app verdict in a separate failure record.
+
+    Keep existing strict behavior (raise, no final cer.json), but do not lose
+    the already observed application result when integrity validation fails.
+    """
+    from .evidence import validate_files
+    from .collectors.publication import FAILURE_RECORD
+    try:
+        validate_files(directory, files)
+    except Exception as exc:
+        failure = {"schema_version": 1, "kind": "benchpark-evidence-integrity-failure",
+            "attempt_id": record["attempt_id"], "condition_id": record["condition_id"],
+            "application_status": record.get("status"), "application_result": record.get("result", {}),
+            "evidence_integrity": "FAILED", "cer_sealed": False,
+            "detected_at": now(), "error_type": type(exc).__name__, "error": str(exc)}
+        failure["record_sha256"] = identity(failure)
+        path = Path(directory) / FAILURE_RECORD
+        if not path.exists() and not path.is_symlink():
+            atomic_json(path, failure)
+        raise

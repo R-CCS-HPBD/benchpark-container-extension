@@ -17,7 +17,7 @@ import subprocess
 import time
 
 from .util import ValidationError, atomic_json
-from .backends.base import command_scope
+from .backends.base import command_scope, prepared_command
 from .reproducibility_rules import canonical
 from .contracts import (base_tools, container_tools, executable_value, validate_targets,
                         validate_preparation, validate_environment, DEPENDENCY_POLICY, ROOT, INPUTS,
@@ -95,10 +95,10 @@ def _container_run(rt, image, scratch, inputs, mounts, command, timeout,
     argv = rt.argv(image, scratch, inputs, mounts, command, environment, pwd=pwd)
     stream = open(log, 'wb') if log is not None else None
     try:
-        with command_scope(rt, argv):
-            with subprocess.Popen(argv, stdout=stream or subprocess.PIPE,
+        with prepared_command(rt, argv) as prepared:
+            with subprocess.Popen(prepared.argv, stdout=stream or subprocess.PIPE,
                                   stderr=subprocess.STDOUT if stream else subprocess.PIPE,
-                                  text=stream is None, env=rt.host_env(), start_new_session=True) as child:
+                                  text=stream is None, env=prepared.host_environment, start_new_session=True) as child:
                 try:
                     stdout, stderr = child.communicate(timeout=timeout)
                 except BaseException as error:
@@ -249,24 +249,41 @@ def dependency_check_delta(before, after):
     return sorted(set(after.get('issues', [])) - set(before.get('issues', [])))
 
 
-def validate_layer_inventory(base_packages, distributions, pins):
+def validate_layer_inventory(base_packages, distributions, pins,
+                             policy='legacy-base-pip-prefix-v1', protected_packages=None):
+    """Validate a private Python Layer against the immutable Common Base.
+
+    Non-locked/legacy paths must not shadow any Base distribution. Only an
+    explicit, correctly-versioned and hash-verified private lock may overlay
+    a *non-protected* Base distribution. The Common Base is never mutated.
+    """
+    if policy not in ('legacy-base-pip-prefix-v1', 'hashed-private-prefix-v1'):
+        raise EnvironmentBuildError('Unknown Python dependency install policy',
+                                    'UNKNOWN_DEPENDENCY_INSTALL_POLICY', {'policy': policy})
     base = {canonical(k): str(v) for k, v in (base_packages or {}).items()}
     fixed = {canonical(k): [str(x) for x in v] for k, v in (pins or {}).items()}
-    conflicts, unpinned = [], []
+    protected = {canonical(k) for k in (protected_packages or {})}
+    conflicts, unpinned, approved = [], [], []
     for item in distributions:
         name, version = canonical(item['name']), str(item['version'])
+        pinned = version in fixed.get(name, [])
         if name in base:
-            conflicts.append({'name': name, 'base_version': base[name], 'layer_version': version})
-        if version not in fixed.get(name, []):
+            delta = {'name': name, 'base_version': base[name], 'layer_version': version}
+            if policy == 'hashed-private-prefix-v1' and pinned and name not in protected:
+                approved.append(delta)
+            else:
+                conflicts.append(delta)
+        if not pinned:
             unpinned.append({'name': name, 'version': version})
     if conflicts:
-        raise EnvironmentBuildError('Python requirements shadow a distribution already supplied by the Common Base',
+        raise EnvironmentBuildError('Python requirements shadow a protected or unapproved Common Base distribution',
                                     'BASE_VERSION_CONFLICT', {'conflicts': conflicts})
     if unpinned:
         raise EnvironmentBuildError('Unpinned additional/transitive dependencies installed by Common Base pip',
                                     'UNPINNED_TRANSITIVE_DEPENDENCY', {'packages': unpinned})
     return {'status': 'passed', 'validated_additions': len(distributions),
-            'base_shadow_conflicts': [], 'unpinned_additions': []}
+            'base_shadow_conflicts': [], 'approved_base_shadows': approved,
+            'unpinned_additions': []}
 
 
 def _safe_log_name(index, relative):
@@ -313,7 +330,8 @@ def prepare_environment(rt, image, scratch, inputs, mounts, spec, attempt, timeo
     try:
         needs = validate_preparation(spec)
         result['required_tools'] = needs
-        requested = container_tools(spec['base']['tools'])
+        from .contracts import execution_tools
+        requested = execution_tools(spec)
         validate_environment(spec.get('environment', {}), needs['python'])
         # Frozen old plans retain their pre-change preparation environment.
         env = {} if spec['dependency_policy'] == DEPENDENCY_POLICY else dict(spec.get('environment', {}))
@@ -386,6 +404,23 @@ def prepare_environment(rt, image, scratch, inputs, mounts, spec, attempt, timeo
             result['phase'] = 'dependency-installation'
             if spec.get('requirements'):
                 command = pip + ['install', '--prefix', PYTHON_PREFIX]
+                # Private-prefix installs must not ask pip to uninstall packages
+                # from an immutable Base SIF. A fully hashed *.lock.txt is a
+                # closed installation input: pip must not resolve unpinned
+                # transitive packages or replace protected Base components.
+                locked_requirements = bool(spec.get('requirement_pins')) and all(
+                    Path(rel).name.endswith('.lock.txt') for rel in spec['requirements'])
+                if locked_requirements:
+                    protected_names = {canonical(p) for p in spec.get('protected_packages', {})}
+                    pinned_names = {canonical(p) for p in spec['requirement_pins']}
+                    overlap = sorted(protected_names.intersection(pinned_names))
+                    if overlap:
+                        raise EnvironmentBuildError(
+                            'Protected Base package cannot be included in private requirements lock',
+                            'PROTECTED_BASE_REQUIREMENT_CONFLICT', {'packages': overlap})
+                    command += ['--ignore-installed', '--no-deps', '--only-binary=:all:', '--require-hashes']
+                result['dependency_install_policy'] = (
+                    'hashed-private-prefix-v1' if locked_requirements else 'legacy-base-pip-prefix-v1')
                 for rel in spec['requirements']:
                     if not rel.startswith('inputs/') or '..' in Path(rel).parts:
                         raise EnvironmentBuildError('Invalid staged requirements path: ' + rel)
@@ -404,7 +439,9 @@ def prepare_environment(rt, image, scratch, inputs, mounts, spec, attempt, timeo
             atomic_json(attempt / 'layer-inventory.json', layer)
             result['resolved_additions'] = layer['distributions']
             result['validation'] = validate_layer_inventory(
-                before['packages'], layer['distributions'], spec.get('requirement_pins', {}))
+                before['packages'], layer['distributions'], spec.get('requirement_pins', {}),
+                policy=result.get('dependency_install_policy', 'legacy-base-pip-prefix-v1'),
+                protected_packages=spec.get('protected_packages', {}))
             activation.update(_prefix_activation(layer, before))
             active = dict(env, **activation)
             result['phase'] = 'dependency-check'

@@ -109,6 +109,10 @@ class RambleGeneration:
         self.values = contributions(values)
         self.provider = validate_contributions(self.values)
 
+    def replaces_software(self):
+        """True only for an explicitly selected exclusive software provider."""
+        return self.provider is not None
+
     def software(self, native, helpers=()):
         """Narrow read-only operations, not a mutable native Experiment handle."""
         if self.provider is None:

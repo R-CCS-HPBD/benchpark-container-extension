@@ -2,8 +2,8 @@
 """Lifecycle broker outside Core. Features, not Core, own integration policy.
 
 The protocol accepted by benchpark.plugins is structural and versioned. All
-contexts consist of declared data; only the generation port accepts two narrow,
-lazy section callbacks. No live Benchpark classes are imported or modified.
+contexts consist of declared data; Spec construction and generation ports accept narrow, lazy Core operations.
+No live Benchpark classes are imported or modified by this broker.
 """
 from dataclasses import dataclass
 from .api import plain
@@ -17,6 +17,12 @@ class Provider:
     api_version = 1
 
     def handle(self, event, context):
+        if event == 'spec_concretize':
+            from .support.spec_request import concretize_request
+            return concretize_request(context)
+        if event == 'software_section':
+            generation = RambleGeneration(context['values'])
+            return generation.software(lambda: None, context['helpers'])
         if event == 'repository_select':
             from .repository_provider import select_repository
             return select_repository(context)

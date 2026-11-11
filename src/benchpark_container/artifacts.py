@@ -81,14 +81,20 @@ def pin_external_artifacts(artifacts, variants):
         output.append(a)
     return output
 
-def materialize(artifacts, resources, attempt):
+def materialize(artifacts, resources, attempt, shared_root=None, shared_names=()):
     validate_targets(artifacts, concrete=True)
     mounts = []
     for a in artifacts:
         record = dict(a)
         if a["location"] == "attempt":
-            source = inside(attempt / "outputs", a["name"])
-            source.mkdir(parents=True)
+            shared = a['name'] in shared_names
+            if shared and shared_root is None:
+                raise ValidationError('Shared output requires an execution group')
+            source = inside(shared_root if shared else attempt / "outputs", a["name"])
+            source.mkdir(parents=True, exist_ok=shared)
+            if source.is_symlink(): raise ValidationError('Writable output must not be a symlink')
+            if shared:
+                record['sharing_scope'] = 'group'
             record["verification"] = "writable-output"
         else:
             if a["location"] == "resource":

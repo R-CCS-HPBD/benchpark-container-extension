@@ -163,6 +163,10 @@ def select_manifest(verified, platform):
 
 def verify_managed(base):
     """Verify the frozen store locator; never consult a mutable catalog again."""
+    from .environment_snapshot import validate_environment_binding, verify_overlay
+    validate_environment_binding(base)
+    if 'overlay' in base:
+        verify_overlay(base['overlay'])
     managed = base.get('managed')
     if not isinstance(managed, dict) or managed.get('store_kind') != 'filesystem':
         raise ValidationError('Unsupported managed image store')

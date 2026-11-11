@@ -103,14 +103,21 @@ def build_locator(root, name, output, snapshots=None, display_name=None, feature
 def verify_seam(checkout):
     """Check the specific read-time port, not mere plugins.py existence."""
     checkout = Path(checkout).resolve()
-    files = {'lib/benchpark/plugins.py': 'def repository_config(',
-             'lib/benchpark/config.py': 'plugins.repository_config(',
-             'lib/benchpark/accounting.py': 'plugins.repository_entries(',
-             'lib/benchpark/cmd/list.py': 'plugins.repository_list_groups('}
+    files = {'lib/benchpark/plugins.py': ('def repository_config(',),
+             'lib/benchpark/config.py': ('plugins.repository_config(',),
+             'lib/benchpark/accounting.py': ('plugins.repository_entries(', 'def _repository_accounting('),
+             'lib/benchpark/cmd/list.py': ('plugins.repository_list_groups(', 'def _print_repository_additions(')}
     for rel, anchor in files.items():
         p = checkout / rel
-        if not p.is_file() or p.is_symlink() or anchor not in p.read_text(encoding='utf-8'):
+        if not p.is_file() or p.is_symlink() or not any(token in p.read_text(encoding='utf-8') for token in anchor):
             raise ExtensionError('Repository discovery port missing: ' + str(p) + '; run updated 02 first')
+    accounting = (checkout / 'lib/benchpark/accounting.py').read_text()
+    listing = (checkout / 'lib/benchpark/cmd/list.py').read_text()
+    additive = 'def _repository_accounting(' in accounting
+    if additive != ('def _print_repository_additions(' in listing):
+        raise ExtensionError('Mixed legacy/additive discovery ports; use a clean patched checkout')
+    if additive and 'def repository_accounting(' not in (checkout / 'lib/benchpark/plugins.py').read_text():
+        raise ExtensionError('Additive accounting loader port missing')
     # Old no-C state is not removed automatically: it may contain site edits.
     for directory in (checkout / 'user-config', checkout.parent / 'benchpark-config'):
         if (directory / 'benchmark-sources.json').exists():

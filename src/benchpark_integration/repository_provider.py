@@ -24,8 +24,6 @@ KINDS = {
 }
 PROVIDER_NAME = re.compile(r'^[a-z][a-z0-9-]*$')
 FEATURE_NAME = re.compile(r'^[A-Za-z][A-Za-z0-9_-]*$')
-FEATURE_NAME = re.compile(r'^[A-Za-z][A-Za-z0-9_-]*$')
-FEATURE_NAME = re.compile(r'^[A-Za-z][A-Za-z0-9_-]*$')
 
 
 def _points():
@@ -189,6 +187,44 @@ class RepositoryProvider:
         return result
 
     def handle(self, event, context):
+        if event == 'repository_accounting':
+            from .accounting import additions
+            return additions(self, context)
+        if event == 'repository_binding':
+            kind = context.get('kind')
+            namespace = context.get('namespace')
+            name = context.get('name')
+            if kind != 'experiments' or not isinstance(namespace, str) or not isinstance(name, str):
+                raise ExtensionError('Invalid qualified repository request')
+            if not self.features:
+                return None
+            paths = self.paths()
+            if kind not in paths:
+                return None
+            repo_path = Path(paths[kind])
+            object_root = repository_object_root(repo_path, kind)
+            # Match the actual, validated repository descriptor, never a
+            # constructed provider name (which is not a stable namespace).
+            import yaml
+            descriptor = yaml.safe_load((repo_path / 'repo.yaml').read_text(encoding='utf-8'))
+            if namespace != descriptor['repo']['namespace']:
+                return None
+            names = repository_names(repo_path, kind)
+            if name not in names:
+                raise ExtensionError('Qualified repository object missing: ' + namespace + '.' + name)
+            object_dir = object_root / name
+            return {
+                'provider': self.name,
+                'display_name': self.display_name,
+                'kind': kind,
+                'namespace': namespace,
+                'name': name,
+                'repository': str(repo_path.resolve()),
+                'object_root': str(object_root.resolve()),
+                'object_dir': str(object_dir.resolve()),
+                'source_root': str(Path(self.source_root).resolve()),
+                'features': list(self.features),
+            }
         if event == 'repository_select':
             kind = context.get('kind')
             name = context.get('name')
@@ -234,6 +270,13 @@ class RepositoryProvider:
             if 'experiments' not in paths:
                 return None
             names = repository_names(Path(paths['experiments']), 'experiments')
+            # Namespace-aware Benchpark displays `namespace.experiment` while
+            # the legacy UI shows `experiment`.  Only claim namespaced entries
+            # from this provider's actual repo.yaml namespace.  Do not claim
+            # identically named objects from a different registered repository.
+            import yaml
+            descriptor = Path(paths['experiments']) / 'repo.yaml'
+            namespace = yaml.safe_load(descriptor.read_text(encoding='utf-8'))['repo']['namespace']
             native_benchmarks = context.get('native_benchmarks', ())
             if not isinstance(native_benchmarks, (tuple, list)) or not all(
                     isinstance(name, str) for name in native_benchmarks):
@@ -246,9 +289,31 @@ class RepositoryProvider:
                 # bound implementations. Listing remains logical: the provider
                 # groups only objects that are external-only, while request-time
                 # repository_select chooses the alternate same-name provider.
-                if benchmark in names and benchmark not in native_benchmarks:
+                if '.' in benchmark:
+                    repo_namespace, short_name = benchmark.rsplit('.', 1)
+                    if repo_namespace == namespace and short_name in names:
+                        items.append(item)
+                elif benchmark in names and benchmark not in native_benchmarks:
                     items.append(item)
-            return {'label': self.display_name, 'items': items}
+            # Display a short, copyable command while preserving the exact
+            # qualified entry as the accounting identity.  Selection is still
+            # performed by the user's explicit feature variants, not display.
+            result = {'label': self.display_name, 'items': items}
+            if kind == 'experiments' and self.features:
+                display = {}
+                for item in items:
+                    head, marker, options = item.partition('+')
+                    if head.startswith(namespace + '.'):
+                        head = head[len(namespace) + 1:]
+                    readable = head + (marker + options if marker else '')
+                    for feature in self.features:
+                        # A positive flag is a required explicit request, not
+                        # part of the repository name or an implied default.
+                        if '+' + feature not in readable.split():
+                            readable += ' +' + feature
+                    display[item] = readable
+                result['display'] = display
+            return result
         if event == 'repository_entries':
             kind = context['kind']
             entries = deepcopy(context['entries'])

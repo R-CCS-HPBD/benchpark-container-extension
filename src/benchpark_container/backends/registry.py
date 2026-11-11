@@ -13,9 +13,14 @@ BACKENDS = {
 }
 
 
-def backend_class(name):
+def backend_class(name, providers=()):
+    from ..providers import validate_descriptors, load_provider
+    validate_descriptors(list(providers))
+    selected = [d for d in providers if d['kind'] == 'runtime' and d['name'] == name]
+    if selected and name in BACKENDS:
+        raise ValidationError('External provider shadows built-in runtime: ' + name)
     try:
-        cls = BACKENDS[name]
+        cls = load_provider(selected[0]) if selected else BACKENDS[name]
     except (KeyError, TypeError) as error:
         raise ValidationError("Unknown container runtime: " + repr(name)) from error
     if (not isinstance(cls, type) or not issubclass(cls, RuntimeBackend)
@@ -25,4 +30,4 @@ def backend_class(name):
 
 
 def create_backend(settings):
-    return backend_class(settings["runtime"])(settings)
+    return backend_class(settings["runtime"], settings.get("providers", []))(settings)

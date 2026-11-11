@@ -106,8 +106,8 @@ def validate_saved_plan(path, resources):
     """Re-check a generated plan and its immutable resources without modifying it."""
     path, resources = Path(path), Path(resources).resolve()
     plan = json.loads(path.read_text(encoding='utf-8'))
-    if plan.get('schema_version') != 1:
-        raise ValidationError('Unsupported execution-plan schema')
+    from .planning import validate_plan_version
+    validate_plan_version(plan)
     for relative, expected in plan['resources'].items():
         item = inside(resources, relative, must_exist=True)
         if sha256(item) != expected:

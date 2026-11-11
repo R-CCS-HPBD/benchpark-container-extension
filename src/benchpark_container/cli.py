@@ -46,6 +46,10 @@ def load_record(path):
             raise ValidationError("CER record checksum mismatch")
     elif data.get("status") not in ("RUNNING",):
         raise ValidationError("Unsealed final CER")
+    from .environment_snapshot import validate_environment_binding
+    validate_environment_binding(data["resolved"].get("base", {}))
+    from .setup_environment import verify_cer_prepared
+    verify_cer_prepared(data)
     return data
 
 
@@ -77,6 +81,21 @@ def verify_recorded_files(record_path, data):
         if "executable" in meta and bool(target.stat().st_mode & 0o111) != meta["executable"]:
             raise ValidationError("CER recorded executable mode mismatch: " + str(rel))
         checked += 1
+    reference = data.get("observed", {}).get("prepared_environment")
+    if reference:
+        from .setup_environment import _validate_record
+        prepared_path = root / reference["record"]
+        prepared = json.loads(prepared_path.read_text(encoding="utf-8"))
+        _validate_record(prepared, data["resolved"])
+        if (prepared["record_sha256"] != reference["record_sha256"]
+                or prepared["lock_sha256"] != reference["lock_sha256"]):
+            raise ValidationError("CER prepared environment reference mismatch")
+        if reference.get("evidence_root") != "source-evidence/prepared-environment":
+            raise ValidationError("CER prepared evidence root mismatch")
+        for rel, expected in prepared["files"].items():
+            kept = data["files"].get(reference["evidence_root"] + "/" + rel)
+            if kept is None or any(kept.get(k) != v for k, v in expected.items()):
+                raise ValidationError("CER lacks original preparation evidence: " + rel)
     return checked
 
 

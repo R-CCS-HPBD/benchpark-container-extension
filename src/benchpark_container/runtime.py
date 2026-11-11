@@ -39,7 +39,7 @@ from .preparation import prepare_environment, EnvironmentBuildError, validate_la
 # Compatibility import for callers of the earlier Apptainer helper.
 from .backends.apptainer import ApptainerBackend as Apptainer
 from .backends import create_backend
-from .backends.base import command_scope
+from .backends.base import command_scope, prepared_command
 
 
 class _ExecutionSignal(KeyboardInterrupt):
@@ -48,41 +48,8 @@ class _ExecutionSignal(KeyboardInterrupt):
         super().__init__("Execution interrupted by signal " + str(signum))
 
 
-def concrete_plan(plan, variables, command, experiment="unknown", repeat="unknown"):
-    # Values only; runtime helper never reopens System or experiment definitions.
-    data = json.loads(json.dumps(plan))
-    parameters = data["parameters"]
-    for key, value in list(parameters.items()):
-        if key in variables:
-            parameters[key] = variables[key]
-        elif isinstance(value, list):
-            raise ValidationError("Matrix value is not concrete: " + key)
-    for key in plan.get("export_variables", []):
-        if key not in variables:
-            raise ValidationError("Missing exported measurement variable: " + key)
-        parameters[key] = variables[key]
-    data["parameters"] = parameters
-    validate_accelerator_contract(data)
-    needs = validate_preparation(data)
-    data["artifacts"] = expand(data["artifacts"], parameters)
-    data["environment"] = expand(data["environment"], parameters)
-    validate_environment(data["environment"], needs["python"])
-    validate_targets(data["artifacts"], data["base"].get("tools", {}).values(), concrete=True)
-    models = validate_model_artifacts(data["artifacts"])
-    data.setdefault("validation", {})["concrete_models"] = models
-    check_no_secrets(command)
-    data["command"] = command
-    data["plan_sha256"] = identity(plan)
-    # Exclude record-only location/repeat values from condition identity.
-    scientific = {k: data[k] for k in ("benchmark", "base", "runtime", "requirements",
-        "setup_scripts", "artifacts", "parameters", "resources", "environment", "command",
-        "dependency_policy", "provenance", "protected_packages", "smoke_imports", "benchmark_content_sha256") if k in data}
-    for key in ("n_repeats", "repeat_index", "experiment_run_dir"):
-        scientific["parameters"] = {k: v for k, v in scientific["parameters"].items() if k != key}
-    data["condition_id"] = identity(scientific)
-    data["ramble_experiment"] = experiment
-    data["repeat_index"] = repeat
-    return data
+# Compatibility re-export for saved callers.
+from .planning import concrete_plan, validate_plan_version
 
 
 def run_logged(command, log_path, timeout, env):
@@ -136,7 +103,7 @@ def run_logged(command, log_path, timeout, env):
 
 
 
-def execute(spec, resources, run_root):
+def execute(spec, resources, run_root, execution_context=None):
     resources = Path(resources).resolve()
     inputs = resources / "inputs"
     attempt, record = start_run(run_root, spec)
@@ -146,6 +113,11 @@ def execute(spec, resources, run_root):
     preparation_start = time.monotonic()
     phase = "preparation"
     rt = None
+    image_lease = None
+    setup_record = None
+    setup_root = None
+    profiler_decoration = None
+    profiler_reference = None
     old_handlers = {}
     if threading.current_thread() is threading.main_thread():
         def interrupted(signum, frame):
@@ -153,6 +125,15 @@ def execute(spec, resources, run_root):
         for signum in (signal.SIGTERM, signal.SIGINT):
             old_handlers[signum] = signal.signal(signum, interrupted)
     try:
+        # In-process legacy callers may omit the version. File entrypoints may not.
+        if "schema_version" in spec:
+            validate_plan_version(spec)
+        if execution_context is not None:
+            execution_context.started(attempt, record)
+        from .environment_snapshot import validate_environment_binding, verify_environment_files
+        environment_snapshot = validate_environment_binding(spec["base"])
+        if environment_snapshot is not None and spec.get("schema_version") not in (2, 3):
+            raise ValidationError("Composite environment requires execution plan schema=2")
         validate_accelerator_contract(spec)
         needs = validate_preparation(spec)
         validate_environment(spec["environment"], needs["python"])
@@ -171,41 +152,90 @@ def execute(spec, resources, run_root):
         native = {"x86_64": "linux/amd64", "aarch64": "linux/arm64"}.get(architecture)
         if expected != "unverified" and expected != native:
             raise ValidationError("Declared image platform does not match execution host")
+        if environment_snapshot is not None:
+            record["observed"]["environment_integrity_before"] = verify_environment_files(spec["base"])
         rt = create_backend(spec["runtime"])
         rt.attach_attempt(attempt)
+        from .acquisition import ImageLease
+        if spec.get("schema_version") != 3 and hasattr(rt, "cache"):
+            image_lease = ImageLease(rt, spec["runtime"].get("image_policy", "cache"), attempt)
+            record["observed"]["image_acquisition"] = image_lease.record()
         runtime_observation = rt.observe_runtime()
         record["observed"]["runtime"] = runtime_observation
         record["observed"]["runtime_version"] = runtime_observation["version"]
-        image = rt.resolve_image(spec["base"], timeout)
+        if spec.get("schema_version") == 3:
+            from .setup_environment import load_prepared, bind_prepared, retain_prepared, execution_base
+            setup_root, setup_record = load_prepared(spec, resources)
+            image = rt.load_prepared_image(execution_base(spec, setup_record), setup_record["image"], timeout)
+            bind_prepared(rt, scratch, setup_root, setup_record)
+            record["observed"]["prepared_environment"] = retain_prepared(attempt, setup_root, setup_record)
+            execution_artifacts = setup_record["artifacts"]
+        else:
+            image = rt.resolve_image(spec["base"], timeout)
+            execution_artifacts = spec["artifacts"]
         record["observed"]["image"] = rt.observe_image(image)
-        mounts = materialize(spec["artifacts"], resources, attempt)
+        if execution_context is None:
+            mounts = materialize(execution_artifacts, resources, attempt)
+        else:
+            mounts = materialize(execution_artifacts, resources, attempt,
+                                 shared_root=execution_context.group / 'shared-outputs',
+                                 shared_names=execution_context.plan['shared_outputs'])
         record["observed"]["mounts"] = mounts
 
-        env_record = prepare_environment(rt, image, scratch, inputs, mounts, spec, attempt, timeout)
+        if setup_record is not None:
+            env_record = setup_record["software_environment"]
+        else:
+            env_record = prepare_environment(rt, image, scratch, inputs, mounts, spec, attempt, timeout)
         record["observed"]["software_environment"] = env_record
         record["result"]["preparation_seconds"] = time.monotonic() - preparation_start
 
         script = "set -euo pipefail\n" + "\n".join(spec["command"]) + "\n"
         (scratch / "benchmark.sh").write_text(script, encoding="utf-8")
         environment = dict(spec["environment"])
+        if execution_context is not None:
+            passed = execution_context.environment()
+            if set(environment) & set(passed):
+                raise ValidationError('Application environment overrides parallel/site-owned bindings')
+            environment.update(passed)
         activation = env_record.get("runtime_environment")
         if env_record.get("state") != "ready" or not isinstance(activation, dict):
             raise ValidationError("Dependency construction did not produce a ready activation contract")
         environment.update(activation)
-        command = rt.argv(image, scratch, inputs, mounts,
-                          [env_record["tools"]["shell"], BENCHMARK_SCRIPT], environment)
+        benchmark_argv = [env_record["tools"]["shell"], BENCHMARK_SCRIPT]
+        if spec.get("profiler", {}).get("enabled"):
+            from .profiler_interop import prepare_capture
+            profiler_decoration, profiler_mounts = prepare_capture(
+                spec, resources, attempt, image, benchmark_argv, mounts)
+            # The existing backend handles both runtime families; mounts remain
+            # source/target/read-only data, not guessed docker/apptainer flags.
+            command = rt.argv(image, scratch, inputs, mounts + profiler_mounts,
+                              profiler_decoration.inner_argv, environment)
+            record["observed"]["profiler_launch"] = {
+                "api_version": 2, "capture_id": spec["profiler"]["capture_id"],
+                "job_sha256": profiler_decoration.job_sha256,
+                "bundle_manifest_sha256": spec["profiler"]["manifest_sha256"]}
+        else:
+            command = rt.argv(image, scratch, inputs, mounts,
+                              benchmark_argv, environment)
         record["observed"]["command"] = command
+        if hasattr(rt, "applied_binding"):
+            record["observed"]["container_binding"] = dict(rt.applied_binding)
         record["observed"]["execution_environment"] = environment
-        phase = "benchmark"
-        with command_scope(rt, command):
+        phase = "profiler-worker" if profiler_decoration is not None else "benchmark"
+        with prepared_command(rt, command) as prepared:
+            record["observed"]["command"] = list(prepared.argv)
             measurement_start = time.monotonic()
-            code, state = run_logged(command, attempt / "benchmark.log", timeout, rt.host_env())
+            code, state = run_logged(prepared.argv, attempt / "benchmark.log", timeout, prepared.host_environment)
             record["result"].update(exit_code=code,
                 benchmark_process_seconds=time.monotonic() - measurement_start,
                 measurement_note="Process time is not a replacement for application FoM; application controls warmup/measurement.")
+            if profiler_decoration is not None:
+                record["result"]["profiler_worker_exit_code"] = code
             if code != 0:
                 record["result"]["failure_phase"] = phase
-                record["result"]["error_code"] = "BENCHMARK_NONZERO_EXIT"
+                record["result"]["error_code"] = (
+                    "PROFILER_WORKER_NONZERO_EXIT" if profiler_decoration is not None
+                    else "BENCHMARK_NONZERO_EXIT")
             record["status"] = state
     except _ExecutionSignal as error:
         code, record["status"] = 128 + error.signum, "INTERRUPTED"
@@ -241,15 +271,103 @@ def execute(spec, resources, run_root):
                 if code == 0:
                     code, record["status"] = 1, "EXECUTION_ERROR"
                     record["result"].update(exit_code=1, failure_phase="cleanup")
+        if image_lease is not None:
+            try:
+                image_lease.close()
+                record["observed"]["image_acquisition"]["lease_cleanup"] = "complete"
+            except Exception as error:
+                record["result"]["image_cleanup_error"] = str(error)
+                if code == 0:
+                    code, record["status"] = 1, "EXECUTION_ERROR"
+                    record["result"].update(exit_code=1, failure_phase="cleanup")
+        if spec.get("base", {}).get("environment_snapshot") is not None:
+            try:
+                from .environment_snapshot import verify_environment_files
+                record["observed"]["environment_integrity_after"] = verify_environment_files(spec["base"])
+            except Exception as error:
+                record["observed"]["environment_integrity_after"] = {"status": "failed", "error": str(error)}
+                record["result"]["application_exit_code"] = record["result"].get("exit_code", code)
+                if code == 0:
+                    code, record["status"] = 1, "EXECUTION_ERROR"
+                    record["result"].update(exit_code=1, failure_phase="environment-integrity")
+        if setup_record is not None:
+            try:
+                from .setup_environment import load_prepared
+                _, after_record = load_prepared(spec, resources)
+                rt.load_prepared_image(execution_base(spec, setup_record), setup_record["image"], timeout)
+                if after_record != setup_record:
+                    raise ValidationError("Prepared record changed during execution")
+                record["observed"]["prepared_environment_integrity_after"] = "verified"
+            except Exception as error:
+                record["observed"]["prepared_environment_integrity_after"] = "failed"
+                record["result"]["application_exit_code"] = record["result"].get("exit_code", code)
+                record["result"]["prepared_environment_error"] = str(error)
+                if code == 0:
+                    code, record["status"] = 1, "EXECUTION_ERROR"
+                    record["result"].update(exit_code=1, failure_phase="environment-integrity")
         partial = attempt / "environment.json"
         if partial.is_file() and "software_environment" not in record["observed"]:
             try:
                 record["observed"]["software_environment"] = json.loads(partial.read_text())
             except (OSError, ValueError):
                 pass
+        if execution_context is not None:
+            try:
+                probe_ok = execution_context.capture_probe(attempt, record)
+            except Exception as error:
+                probe_ok = False
+                record['result']['parallel_probe'] = 'failed'
+                record['result']['parallel_probe_error'] = str(error)
+            if not probe_ok and code == 0:
+                code, record['status'] = 1, 'FAILED'
+                record['result'].update(exit_code=1, failure_phase='parallel-validation')
+        if profiler_decoration is not None:
+            # Never let an unverified or changed capture look like a successful
+            # benchmark/CER simply because the workload happened to exit 0.
+            try:
+                from .profiler_interop import collect_capture
+                profiler_reference = collect_capture(attempt, record, profiler_decoration)
+                record["result"]["profiler_status"] = profiler_reference["profiling_status"]
+                record["result"]["profiler_accepted"] = profiler_reference["accepted"]
+                # A Profiler Worker is not the benchmark itself. Preserve the
+                # benchmark's observed exit codes separately where available.
+                from .profiler_interop import inspect_capture as read_profiler_observation
+                details = read_profiler_observation(profiler_decoration)
+                workload = details.get("workload", {})
+                record["result"]["profiler_workload_status"] = workload.get("status")
+                record["result"]["application_exit_codes"] = workload.get("exit_codes", [])
+                # `failure_phase` remains the outer lifecycle stage (profiler-worker).
+                # Set a separate cause only after verifying a genuine nonzero
+                # application exit in the Profiler's finalized observation.
+                from .profiler_interop import verified_benchmark_nonzero
+                if code != 0 and verified_benchmark_nonzero(profiler_reference, details):
+                    record["result"]["failure_origin"] = "benchmark"
+                if not profiler_reference["accepted"] and code == 0:
+                    code, record["status"] = 1, "FAILED"
+                    record["result"].update(exit_code=1, failure_phase="profiler-validation")
+            except Exception as error:
+                record["result"]["profiler_registration"] = {
+                    "status": "FAILED", "error_type": type(error).__name__, "error": str(error)}
+                if code == 0:
+                    code, record["status"] = 1, "FAILED"
+                    record["result"].update(exit_code=1, failure_phase="profiler-evidence")
         try:
             finish_run(attempt, record)
+            if execution_context is not None:
+                execution_context.completed(attempt, record, code)
             print("BPCE_CER=" + str(attempt / "cer.json"), file=sys.stderr)
+            if profiler_reference is not None:
+                # No mutations are permitted after seal; an external receipt is
+                # supplemental and can be retried with the same final CER hash.
+                from .profiler_interop import link_capture
+                receipt_directory = attempt.parent / "profiler-links" / attempt.name
+                try:
+                    link = link_capture(attempt, profiler_decoration, profiler_reference,
+                                        receipt_directory=receipt_directory)
+                    print("BPCE_PROFILER_LINK=" + link["receipt"], file=sys.stderr)
+                except Exception as error:
+                    print("BPCE_PROFILER_LINK_PENDING=" + type(error).__name__ + ": " + str(error),
+                          file=sys.stderr)
         finally:
             for signum, handler in old_handlers.items():
                 signal.signal(signum, handler)
@@ -263,10 +381,28 @@ def main():
     p.add_argument("--spec-sha256", required=True)
     p.add_argument("--resources", required=True, type=Path)
     p.add_argument("--run-root", required=True, type=Path)
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument('--setup-environment', action='store_true')
+    mode.add_argument('--parallel-launch', action='store_true')
+    mode.add_argument('--parallel-task', type=Path)
     args = p.parse_args()
     if sha256(args.spec) != args.spec_sha256:
         p.error("Concrete spec hash mismatch")
     spec = json.loads(args.spec.read_text(encoding="utf-8"))
+    validate_plan_version(spec)
+    if args.setup_environment:
+        from .setup_environment import prepare
+        ready = prepare(spec, args.resources)
+        print("BPCE_SETUP_READY=" + ready["record_sha256"])
+        return 0
+    if args.parallel_launch:
+        from .parallel.runner import launch
+        return launch(spec, args.spec, args.resources, args.run_root, Path(sys.argv[0]).resolve())
+    if args.parallel_task:
+        from .parallel.runner import task
+        return task(spec, args.resources, args.run_root, args.parallel_task)
+    if 'parallel' in spec:
+        p.error('A parallel plan must be entered through its coordinator')
     return execute(spec, args.resources, args.run_root)
 
 

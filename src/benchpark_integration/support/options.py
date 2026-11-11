@@ -39,6 +39,8 @@ def prepare_request(data):
     native = set(data['native_names'])
     defaults, settings = data['defaults'], data['settings']
     known = set(entries('benchpark.extensions')) | set(data.get('declared_features', ()))
+    if data.get('native_owner_priority', False):
+        known -= native - set(settings)
     schema, selection, required = {}, [], {}
     for name in sorted(set(explicit) & known):
         if name in native:

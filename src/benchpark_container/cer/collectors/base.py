@@ -28,16 +28,25 @@ class CommandResult:
 
 
 class CommandRunner:
+    def __init__(self, *, owns_process_group=True):
+        self.owns_process_group = owns_process_group
+
     def which(self, name):
         return shutil.which(name)
 
     def run(self, argv: Sequence[str], timeout=15.0):
+        from .bounded import run_bounded
         try:
-            cp = subprocess.run(list(argv), capture_output=True, text=True,
-                                timeout=timeout, check=False)
-            return CommandResult(tuple(argv), cp.returncode, cp.stdout, cp.stderr)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            return CommandResult(tuple(argv), 127, '', str(exc))
+            cp = run_bounded(argv, timeout,
+                owns_process_group=getattr(self, "owns_process_group", True))
+            error = cp.stderr.decode('utf-8', errors='replace')
+            if cp.outcome != 'completed':
+                error += '\nCER command execution: ' + cp.outcome
+            return CommandResult(tuple(argv), cp.returncode,
+                cp.stdout.decode('utf-8', errors='replace'), error)
+        except (OSError, ValueError) as exc:
+            return CommandResult(tuple(argv), 127, '', type(exc).__name__ + ': ' + str(exc))
+
 
 
 @dataclasses.dataclass
@@ -45,6 +54,7 @@ class CollectorContext:
     attempt: Path
     env: Mapping[str, str] = dataclasses.field(default_factory=lambda: dict(os.environ))
     max_evidence_bytes: int = 8 * 1024 * 1024
+    capture_phase: str = "post-execution-finalization"
 
     def __post_init__(self):
         self.attempt = Path(self.attempt)
@@ -73,19 +83,21 @@ def _sha(data):
 
 
 def write_evidence(ctx, result, relative, data):
-    rel = Path(relative)
-    if rel.is_absolute() or '..' in rel.parts:
-        raise ValueError('unsafe evidence path: ' + str(relative))
+    from .publication import checked_path, atomic_new
+    # A collector can only create new files in its private context. Publication
+    # into the actual Attempt/Node belongs to the parent Collector coordinator.
+    key = 'cer-evidence/' + str(relative)
+    path = checked_path(ctx.attempt, key, mkdir=True)
     raw = data.encode('utf-8') if isinstance(data, str) else data
+    if not isinstance(raw, bytes):
+        raise TypeError('Evidence must be text or bytes')
     if len(raw) > ctx.max_evidence_bytes:
         raw = raw[:ctx.max_evidence_bytes]
         result.add_error('evidence truncated: ' + str(relative))
-    path = ctx.evidence / rel
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(raw)
-    key = str(path.relative_to(ctx.attempt))
+    atomic_new(path, raw)
     result.files[key] = {'sha256': _sha(raw), 'bytes': len(raw)}
     return key
+
 
 
 def record_command(ctx, result, runner, stem, argv, timeout=15.0):

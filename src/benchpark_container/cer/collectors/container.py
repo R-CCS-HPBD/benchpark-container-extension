@@ -50,10 +50,22 @@ def collect_container(record):
             'catalog_entry_sha256':selection.get('entry_sha256'),
             'managed':selection.get('managed'),
         },
-        'gpu_passthrough':_gpu_passthrough(command),
+        'gpu_passthrough':(observed.get('container_binding') or {}).get('accelerator', _gpu_passthrough(command)),
+        'gpu_binding_basis':(observed.get('container_binding') or {}).get('basis', 'legacy-command-summary'),
+        'device_use_verified':False,
         'mount_count':len(observed.get('mounts') or []),
         'environment_names':sorted((observed.get('execution_environment') or {}).keys()),
         'software_imports':{k:{'version':v.get('version'),'file_sha256':v.get('file_sha256')}
                             for k,v in imports.items() if isinstance(v,dict)},
     }}
+    if base.get('environment_snapshot') is not None:
+        snapshot = base['environment_snapshot']
+        r.observed['container']['environment'] = {
+            'environment_sha256': snapshot['environment_sha256'],
+            'snapshot_sha256': snapshot['snapshot_sha256'],
+            'composition': snapshot['composition'],
+            'build_record_sha256': snapshot['build_record_sha256'],
+            'integrity_before': observed.get('environment_integrity_before'),
+            'integrity_after': observed.get('environment_integrity_after'),
+        }
     return r

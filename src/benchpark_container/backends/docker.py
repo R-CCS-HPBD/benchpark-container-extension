@@ -10,10 +10,44 @@ import tempfile
 
 from .oci import OCIRuntimeBackend
 from ..util import ValidationError
+from pathlib import Path
 
 
 class DockerBackend(OCIRuntimeBackend):
     name = 'docker'
+
+    def argv(
+        self,
+        image,
+        scratch,
+        inputs,
+        mounts,
+        command,
+        environment=None,
+        pwd="/bpce/work",
+    ):
+        """Give Docker workloads a private writable HOME on the scratch bind.
+
+        Docker containers use a read-only root filesystem, while some runtime
+        libraries ignore XDG_CACHE_HOME and write below ~/.cache.  Keep those
+        writes inside the per-attempt scratch area.  An explicitly declared
+        experiment HOME still wins.
+        """
+        scratch = Path(scratch).resolve()
+        (scratch / "home").mkdir(parents=True, exist_ok=True)
+
+        env = {k: str(v) for k, v in (environment or {}).items()}
+        env.setdefault("HOME", "/bpce/home")
+
+        return super().argv(
+            image,
+            scratch,
+            inputs,
+            mounts,
+            command,
+            env,
+            pwd,
+        )
 
     @classmethod
     def validate_config(cls, settings):

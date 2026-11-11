@@ -146,8 +146,45 @@ def stage_workspace(source, configs, system_source, copier, include_fn):
         p = Path(configs) / "modifier_repos.yaml"
         if p.exists():
             raise ExtensionError("Reserved workspace config filename: " + str(p))
-        repos = [str(workspace / STATE_DIR / "resources" / relative_path(r))
-                 for r in data["modifier_repositories"]]
+        # Ramble's workspace modifier_repos setting replaces the default search
+        # list, rather than extending it. Preserve the native Benchpark Core
+        # repository (allocation, etc.) alongside Extension-owned modifiers.
+        # Resolve through the *active* Core checkout, never an old source tree
+        # or a site-specific absolute path baked into Extension/Apps.
+        # Benchpark Core supplies base_paths during normal CLI execution.
+        # Some independent Extension tests install an in-memory namespace stub
+        # with a ModuleSpec but NO on-disk Core. ModuleSpec alone is not proof
+        # that a real Core is active. Do not infer from __spec__ alone.
+        import sys
+        try:
+            from benchpark import base_paths
+        except ImportError as exc:
+            core_module = sys.modules.get("benchpark")
+            core_file = getattr(core_module, "__file__", None)
+            core_origin = getattr(getattr(core_module, "__spec__", None), "origin", None)
+            real_core = any(
+                isinstance(value, str) and bool(value) and Path(value).is_file()
+                for value in (core_file, core_origin)
+            )
+            if real_core:
+                raise ExtensionError("Active Benchpark Core base paths unavailable") from exc
+            # In-memory Core-less Extension fixture: there is no native
+            # Modifier Repository to add; preserve the frozen Extension repo.
+            native = None
+        else:
+            # In LLNL Benchpark, `from benchpark import base_paths` returns
+            # the *module*. The root is on its `base_paths` object. Core-less
+            # Extension unit fixtures can expose the object directly.
+            core_paths = getattr(base_paths, "base_paths", base_paths)
+            core_root = getattr(core_paths, "benchpark_root", None)
+            if not isinstance(core_root, (str, Path)) or not str(core_root):
+                raise ExtensionError("Active Benchpark Core root unavailable")
+            native = (Path(core_root) / "modifiers").resolve()
+            if not (native / "modifier_repo.yaml").is_file():
+                raise ExtensionError("Native Benchpark modifier repository missing: " + str(native))
+        frozen = [str(workspace / STATE_DIR / "resources" / relative_path(r))
+                  for r in data["modifier_repositories"]]
+        repos = list(dict.fromkeys(([str(native)] if native is not None else []) + frozen))
         p.write_text(yaml.safe_dump({"modifier_repos": repos}), encoding="utf-8")
     # Workspace-scoped application definitions take precedence over the live
     # registered repository. Existing experiments never reread updated app code.
@@ -183,6 +220,20 @@ class WorkspaceSession:
     def __init__(self, source, output):
         self.source = Path(source)
         self.manifest = guard_workspace(source, output)
+
+    def stage_inputs(self, configs, system_source, common_source, common_target,
+                     template_target, include):
+        """Handle the narrow filesystem-staging port, never bootstrap/setup.
+
+        Existing stage/common/template methods remain for older Core seams.
+        A selected session cannot silently fall back to live Native inputs.
+        """
+        if not self.manifest:
+            raise ExtensionError("Selected staging requires a frozen manifest")
+        if not stage_workspace(self.source, configs, system_source, None, include):
+            raise ExtensionError("Frozen staging was not handled")
+        self.common(common_source, common_target, None, include)
+        self.template(None, template_target)
 
     def stage(self, configs, system_source, native_copy, include):
         if not stage_workspace(self.source, configs, system_source, None, include):

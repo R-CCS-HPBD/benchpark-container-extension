@@ -27,7 +27,8 @@ def setup_parser(parser):
         p.add_argument('image', help='catalog:name or an unambiguous name')
         p.add_argument('--release', required=True)
     p = sub.add_parser('register', help='Import bytes, verify, then publish an immutable release')
-    p.add_argument('--catalog', required=True)
+    p.add_argument('--catalog', help='Omit when exactly one catalog is registered')
+    p.add_argument('source_ref', nargs='?', help='SIF path or OCI source; alternative to --source')
     p.add_argument('--manifest', type=Path, help='YAML declaration containing all platform/runtime bindings')
     p.add_argument('--name'); p.add_argument('--release')
     p.add_argument('--kind', choices=('sif', 'oci'))
@@ -53,18 +54,26 @@ def setup_parser(parser):
 
 def declaration(args):
     from .catalog.config import load_yaml
+    positional = getattr(args, 'source_ref', None)
+    if positional:
+        if args.source or args.manifest:
+            raise ValidationError('Source may be supplied only once')
+        args.source = positional
     if args.manifest:
         if any((args.name, args.release, args.kind, args.source, args.oci_layout, args.platform,
                 args.accelerator, args.sha256, args.digest, args.runtime)):
             raise ValidationError('--manifest cannot be combined with inline image declarations')
         data = load_yaml(args.manifest)
         # Relative source references are anchored to the declaration, not CWD.
-        for item in data.get('artifacts', []):
+        parts = data.get('artifacts', []) if data.get('schema_version') != 2 else [e.get('base', {}) for e in data.get('environments', [])]
+        for item in parts:
             if 'oci_layout' in item and not Path(item['oci_layout']).is_absolute():
                 item['oci_layout'] = str((args.manifest.resolve().parent / item['oci_layout']).resolve())
         return data
+    from .catalog.inputs import complete_registration
+    complete_registration(args)
     if not all((args.name, args.release, args.kind, args.platform, args.accelerator)):
-        raise ValidationError('Inline registration requires --name --release --kind --platform --accelerator')
+        raise ValidationError('Image platform cannot be inferred; declare --platform (GPU compatibility requires --accelerator)')
     tools = {'shell': args.base_shell}
     if args.base_python:
         tools['python'] = args.base_python
@@ -103,8 +112,10 @@ def command(args):
             alias, catalog, entry = lookup(args.image, args.release, args.catalog_config)
             result = entry if action == 'show' else catalog.validate(entry['name'], entry['release'])
         else:
+            if args.catalog is None and len(config['catalogs']) == 1:
+                args.catalog = next(iter(config['catalogs']))
             if args.catalog not in config['catalogs']:
-                raise ValidationError('Register the catalog alias first: ' + args.catalog)
+                raise ValidationError('Register the catalog alias first: ' + str(args.catalog))
             if args.timeout <= 0:
                 raise ValidationError('--timeout must be positive')
             result = Catalog(config['catalogs'][args.catalog]).register(declaration(args),

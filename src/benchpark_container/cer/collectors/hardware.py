@@ -86,7 +86,7 @@ def _collect_nvidia(ctx, runner):
     r.observed={'accelerator':{
         'vendor':'nvidia','collector':'nvidia-smi','devices':devices,
         'post_execution_state':{
-            'capture_phase':'post-execution-finalization',
+            'capture_phase':ctx.capture_phase,
             'captured_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),
             'devices':state_devices,
             'evidence':['cer-evidence/hardware/nvidia/state.stdout.log'],
@@ -120,7 +120,7 @@ def _collect_amd(ctx, runner):
     if has_smi:
         accelerator['static_configuration_evidence']=['cer-evidence/hardware/amd/static.stdout.log']
         accelerator['post_execution_state']={
-            'capture_phase':'post-execution-finalization',
+            'capture_phase':ctx.capture_phase,
             'captured_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),
             'evidence':['cer-evidence/hardware/amd/metric.stdout.log'],
         }

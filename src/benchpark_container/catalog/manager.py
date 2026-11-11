@@ -20,6 +20,9 @@ def fixed_release(value):
 
 
 def validate_manifest(data):
+    if isinstance(data, dict) and data.get('schema_version') == 2:
+        from .environments import validate_declaration
+        return validate_declaration(data)
     strict(data, ('schema_version', 'name', 'release', 'artifacts'), 'image registration',
            ('schema_version', 'name', 'release', 'artifacts'))
     if data['schema_version'] != 1:
@@ -94,20 +97,32 @@ class Catalog:
     def read(self, name, release):
         p = regular_path(self.root, str(self._entry_path(name, release).relative_to(self.root)))
         entry = read_json(p)
-        if (entry.get('schema_version') != 1 or entry.get('name') != name
+        if (type(entry.get('schema_version')) is not int or entry.get('schema_version') not in (1, 2) or entry.get('name') != name
                 or entry.get('release') != release or entry.get('catalog_id') != self.header['catalog_id']
-                or not isinstance(entry.get('artifacts'), list) or not entry['artifacts']):
+                or not isinstance(entry.get('artifacts' if entry.get('schema_version') == 1 else 'environments'), list)
+                or not entry.get('artifacts' if entry.get('schema_version') == 1 else 'environments')):
             raise ValidationError('Catalog entry identity/schema mismatch')
         body = dict(entry); expected = body.pop('entry_sha256', None)
         if identity(body) != expected:
             raise ValidationError('Immutable catalog entry checksum mismatch')
         check_no_secrets(entry)
+        if entry['schema_version'] == 2:
+            from .environments import validate_entry
+            validate_entry(self, entry)
         return entry
 
     def list(self):
         rows = []
         for path in sorted((self.root / 'entries').glob('*/*.json')):
             data = self.read(path.parent.name, path.stem)
+            if data['schema_version'] == 2:
+                images = [self.image(e) for e in data['environments']]
+                rows.append({'name': data['name'], 'release': data['release'],
+                    'integrity': 'NOT_CHECKED_USE_VALIDATE',
+                    'storage_present': all(Path(i['source']).exists() if i['kind'] == 'sif' else (self.root / i['managed']['relative_path']).exists() for i in images) and all(Path(i['overlay']['source']).exists() for i in images if 'overlay' in i),
+                    'environments': [{'id': e['id'], 'platform': e['platform'], 'accelerator': e['accelerator'],
+                        'overlay': 'overlay' in e, 'runtime_validation': 'DECLARED_SEE_SHOW' if e.get('validations') else 'NOT_PROVIDED'} for e in data['environments']]})
+                continue
             rows.append({'name': data['name'], 'release': data['release'],
                          'integrity': 'NOT_CHECKED_USE_VALIDATE',
                          'storage_present': all((self.root/a['content']['relative_path']).exists() for a in data['artifacts']),
@@ -115,10 +130,16 @@ class Catalog:
         return rows
 
     def image(self, artifact):
+        if 'base' in artifact:
+            from .environments import environment_image
+            return environment_image(self, artifact)
         return store_class(self.header['store']['kind'])(self.root).runtime_image(artifact)
 
     def validate(self, name, release):
         entry = self.read(name, release)
+        if entry['schema_version'] == 2:
+            from .environments import verify_entry
+            return verify_entry(self, entry)
         for item in entry['artifacts']:
             verify_managed(self.image(item))
         return {'name': name, 'release': release, 'status': 'VERIFIED_STORED',
@@ -127,6 +148,9 @@ class Catalog:
                 'source_equivalence': 'NOT_ASSERTED'}
 
     def register(self, declaration, skopeo='skopeo', timeout=3600):
+        if isinstance(declaration, dict) and declaration.get('schema_version') == 2:
+            from .environments import register
+            return register(self, declaration, skopeo, timeout)
         data = json.loads(json.dumps(validate_manifest(declaration)))
         # Resolve mutable local source paths to bytes BEFORE idempotency checks.
         # A rewritten foo.sif must not silently reuse its previous release.
